@@ -2,11 +2,11 @@
 
 ## Goal
 
-Build the `rustank` Rust MCP server with all 14 tools defined in DESIGN.md, using the rmcp 1.7.0 procedural-macro-based API and rustpython-parser 0.4.0.
+Build the `rustrank` Rust MCP server with all 14 tools defined in DESIGN.md, using the rmcp 1.7.0 procedural-macro-based API and rustpython-parser 0.4.0.
 
 ## Architecture
 
-**Single binary crate** `rustank` at `packages/rustank/`. Tools are grouped by feature into modules, composed via `#[tool_router]`. The `Context` struct (parse-once AST cache + optional git2 handle) is shared across all tool handlers.
+**Single binary crate** `rustrank` at `src/`. Tools are grouped by feature into modules, composed via `#[tool_router]`. The `Context` struct (parse-once AST cache + optional git2 handle) is shared across all tool handlers.
 
 **Transport:** Streamable HTTP over `axum`, falling back to STDIO. The rmcp 1.7.0 API uses:
 - `#[tool(name = "...")]` procedural macro per handler
@@ -34,20 +34,20 @@ Build the `rustank` Rust MCP server with all 14 tools defined in DESIGN.md, usin
 
 | File | Responsibility |
 |---|---|
-| `Cargo.toml` (root) | Workspace root with `members = ["packages/rustank"]` |
-| `packages/rustank/Cargo.toml` | Crate manifest, all dependencies |
-| `packages/rustank/src/main.rs` | Entry point, `mod` declarations, transport startup |
-| `packages/rustank/src/error.rs` | `AppError` enum (8 variants) + `Result<T>` |
-| `packages/rustank/src/context.rs` | Parsing cache, source file walk, git lazy-open |
-| `packages/rustank/src/fmt.rs` | `TableRow`, `CodeRankRow`, `HotspotRow` output types |
-| `packages/rustank/src/tools/mod.rs` | Module + router assembly + `ALL_TOOLS` |
-| `packages/rustank/src/tools/search.rs` | `contextual_search`, `smart_code_search`, `api_usage` |
-| `packages/rustank/src/tools/code_rank.rs` | `coderank_analysis`, `code_hotspots` |
-| `packages/rustank/src/tools/trace.rs` | `trace_data_flow`, `trace_feature_impl`, `trace_dep_impact` |
-| `packages/rustank/src/tools/analysis.rs` | `error_patterns`, `perf_bottleneck`, `exec_paths` |
-| `packages/rustank/src/tools/config.rs` | `get_config`, `set_config` (JSON env file) |
-| `packages/rustank/tests/fixtures.rs` | Fixture management (copy real repos to tempdirs) |
-| `packages/rustank/tests/integration.rs` | 14 integration tests (1 fixture × 14 tools) |
+| `Cargo.toml` (root) | Workspace root with `members = ["src"]` |
+| `src/Cargo.toml` | Crate manifest, all dependencies |
+| `src/src/main.rs` | Entry point, `mod` declarations, transport startup |
+| `src/src/error.rs` | `AppError` enum (8 variants) + `Result<T>` |
+| `src/src/context.rs` | Parsing cache, source file walk, git lazy-open |
+| `src/src/fmt.rs` | `TableRow`, `CodeRankRow`, `HotspotRow` output types |
+| `src/src/tools/mod.rs` | Module + router assembly + `ALL_TOOLS` |
+| `src/src/tools/search.rs` | `contextual_search`, `smart_code_search`, `api_usage` |
+| `src/src/tools/code_rank.rs` | `coderank_analysis`, `code_hotspots` |
+| `src/src/tools/trace.rs` | `trace_data_flow`, `trace_feature_impl`, `trace_dep_impact` |
+| `src/src/tools/analysis.rs` | `error_patterns`, `perf_bottleneck`, `exec_paths` |
+| `src/src/tools/config.rs` | `get_config`, `set_config` (JSON env file) |
+| `src/tests/fixtures.rs` | Fixture management (copy real repos to tempdirs) |
+| `src/tests/integration.rs` | 14 integration tests (1 fixture × 14 tools) |
 
 ---
 
@@ -70,27 +70,27 @@ P6: Polish       (Tasks 18-20): tests, docs, CI config
 **File:** `Cargo.toml`
 
 **Steps:**
-1. Create workspace Cargo.toml with `members = ["packages/rustank"]`, `resolver = "2"`
-2. **Verify:** `cargo metadata --no-deps --format-version=1 | jq '.workspace_members'` outputs `["rustank 0.1.0 ..."]`
+1. Create workspace Cargo.toml with `members = ["src"]`, `resolver = "2"`
+2. **Verify:** `cargo metadata --no-deps --format-version=1 | jq '.workspace_members'` outputs `["rustrank 0.1.0 ..."]`
 3. **Acceptance:** `cargo check --workspace` passes from repo root
 
 ---
 
-### Task 2: Crate Manifest (`packages/rustank/Cargo.toml`)
+### Task 2: Crate Manifest (`src/Cargo.toml`)
 
-**File:** `packages/rustank/Cargo.toml`
+**File:** `src/Cargo.toml`
 
 **Steps:**
-1. Create `packages/rustank/` directory structure
+1. Create `src/` directory structure
 2. Write Cargo.toml with all dependencies listed above. `git2` is **non-optional** (lazy-loaded at runtime, but always compiled).
-3. **Verify:** `cargo check -p rustank` compiles with correct dependency versions
+3. **Verify:** `cargo check -p rustrank` compiles with correct dependency versions
 4. **Acceptance:** All crates resolve, no warnings about unused/cyclic deps
 
 ---
 
 ### Task 3: Error Module (`error.rs`)
 
-**File:** `packages/rustank/src/error.rs`
+**File:** `src/src/error.rs`
 
 **Error Enum (8 variants, in order of frequency):**
 ```rust
@@ -121,14 +121,14 @@ pub type Result<T> = std::result::Result<T, AppError>;
 1. Write error.rs with enum above
 2. Add to main.rs: `mod error;`
 3. Write 3 unit tests: `graph` string contains label, `parse` includes path, `not_a_git` includes path
-4. **Verify:** `cargo check -p rustank` passes (no `git2` feature conflict)
+4. **Verify:** `cargo check -p rustrank` passes (no `git2` feature conflict)
 5. **Acceptance:** All 3 error tests pass
 
 ---
 
 ### Task 4: Context Module + Parse-Once Cache
 
-**File:** `packages/rustank/src/context.rs`
+**File:** `src/src/context.rs`
 
 **Structs:**
 
@@ -310,7 +310,7 @@ pub struct Context {
 **Tools:** `get_config`, `set_config`
 
 **Implementation:**
-- Uses a JSON file (`.rustank_config.json`) as a local configuration store
+- Uses a JSON file (`.rustrank_config.json`) as a local configuration store
 - `get_config`: reads JSON, returns all keys
 - `set_config`: writes JSON, returns updated config
 
@@ -323,7 +323,7 @@ pub struct Context {
 
 ### Task 10: Router Assembly (`tools/mod.rs`)
 
-**File:** `packages/rustank/src/tools/mod.rs`
+**File:** `src/src/tools/mod.rs`
 
 **Structure:**
 ```rust
@@ -362,7 +362,7 @@ impl RustankRouter {
 
 ### Task 11: Server Entry Point (`main.rs`)
 
-**File:** `packages/rustank/src/main.rs`
+**File:** `src/src/main.rs`
 
 **Structure:**
 ```rust
@@ -391,7 +391,7 @@ fn main() {
 
 ### Task 12: Test Fixtures
 
-**File:** `packages/rustank/tests/fixtures.rs`
+**File:** `src/tests/fixtures.rs`
 
 **Approach:**
 - Use real repos from `tests/fixtures/` directory (git clone them during test setup)
@@ -411,7 +411,7 @@ fn main() {
 
 ### Task 13: Integration Tests
 
-**File:** `packages/rustank/tests/integration.rs`
+**File:** `src/tests/integration.rs`
 
 **Tests (14 tools × 1 fixture = 14 tests):**
 1. `test_contextual_search_simple` — regex search with 1 match
