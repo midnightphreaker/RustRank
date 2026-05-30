@@ -6,7 +6,7 @@
 
 | **Aspect** | **Decision** |
 |---|---|
-| Project | New crate: `rustank` (single binary) |
+| Project | New crate: `rustrank` (single binary) |
 | Cargo Workspace | `/search-tools-mcp/Cargo.toml` (monorepo with existing Python project) |
 | MCP Framework | `rmcp = "1.7.0"` with `#[tool]` / `#[tool_router]` procedural macros |
 | Transport | Streamable HTTP (primary) + STDIO (fallback via `serve_server()`) |
@@ -19,56 +19,48 @@
 ## Project Structure
 
 ```
-search-tools-mcp/
-├── Cargo.toml                          # Workspace root — defines members
-├── packages/
-│   └── rustank/                        # RustRank MCP server
-│       ├── Cargo.toml                  # name = "rustank", edition = "2024"
-│       ├── src/
-│       │   ├── main.rs                 # Entry point — initializes Router, Server, transport
-│       │   ├── router.rs               # Router composition — all tool routers
-│       │   ├── server.rs               # Server config — transports, auth, middleware
-│       │   ├── context.rs              # Shared RepoContext + ParseCache
-│       │   ├── error.rs                # AppError enum + Result<T>
-│       │   ├── fmt.rs                  # Response formatting + table rendering
-│       │   ├── analyzer/               # Code analysis — CodeRank, hotspots, trace
-│       │   │   ├── mod.rs
-│       │   │   ├── coderank.rs         # Bidirectional PageRank implementation
-│       │   │   ├── hotspots.rs         # Code hotspots analysis (merge + frequency)
-│       │   │   ├── data_flow.rs        # Data flow tracing across modules
-│       │   │   └── trace.rs            # Dependency / call chain tracing
-│       │   ├── tools/                  # MCP tool implementations
-│       │   │   ├── mod.rs
-│       │   │   ├── search.rs           # contextual_search, smart_code_search, api_usage
-│       │   │   ├── code_rank.rs        # coderank_analysis, code_hotspots
-│       │   │   ├── trace.rs            # trace_data_flow, feature_impl, dep_impact
-│       │   │   ├── analysis.rs         # error_patterns, perf_bottleneck, exec_path
-│       │   │   ├── git.rs              # repo_analysis, repo_symbols
-│       │   │   └── config.rs           # get_config, set_config
-│       │   └── parser/                 # Python AST parsing layer
-│       │       ├── mod.rs
-│       │       ├── symbols.rs          # Import/def extraction, name resolution
-│       │       └── tokens.rs           # Token stream & pattern matching
-│       ├── tests/
-│       │   ├── mod.rs                  # Integration test entry point
-│       │   ├── fixtures.rs             # Fixture management (copy real repos)
-│       │   ├── snapshot/               # Expected output comparisons
-│       │   │   ├── coderank.py         # Python-side CodeRank for verification
-│       │   │   └── hotspots.py         # Python hotspot analysis reference
-│       │   └── integration/            # End-to-end tool tests
-│       │       ├── test_search.rs
-│       │       ├── test_coderank.rs
-│       │       ├── test_trace.rs
-│       │       ├── test_analysis.rs
-│       │       └── test_git.rs
-│       └── benches/                    # Micro-benchmarks (optional)
-├── .superpowers/brainstorm/            # brainstorm output (visual companion)
-├── docs/
-│   └── superpowers/
-│       ├── specs/
-│       │   └── 2026-05-16-rustank-design.md  ← this file
-│       └── plans/
-│           └── 2026-05-16-rustank-plan.md     # Implementation plan (future)
+  rustrank/                       # RustRank MCP server
+  ├── Cargo.toml                  # name = "rustrank", edition = "2024"
+  ├── src/
+  │   ├── main.rs                 # Entry point — initializes Router, Server, transport
+  │   ├── router.rs               # Router composition — all tool routers
+  │   ├── server.rs               # Server config — transports, auth, middleware
+  │   ├── context.rs              # Shared RepoContext + ParseCache
+  │   ├── error.rs                # AppError enum + Result<T>
+  │   ├── fmt.rs                  # Response formatting + table rendering
+  │   ├── analyzer/               # Code analysis — CodeRank, hotspots, trace
+  │   │   ├── mod.rs
+  │   │   ├── coderank.rs         # Bidirectional PageRank implementation
+  │   │   ├── hotspots.rs         # Code hotspots analysis (merge + frequency)
+  │   │   ├── data_flow.rs        # Data flow tracing across modules
+  │   │   └── trace.rs            # Dependency / call chain tracing
+  │   ├── tools/                  # MCP tool implementations
+  │   │   ├── mod.rs
+  │   │   ├── search.rs           # contextual_search, smart_code_search, api_usage
+  │   │   ├── code_rank.rs        # coderank_analysis, code_hotspots
+  │   │   ├── trace.rs            # trace_data_flow, feature_impl, dep_impact
+  │   │   ├── analysis.rs         # error_patterns, perf_bottleneck, exec_path
+  │   │   ├── git.rs              # repo_analysis, repo_symbols
+  │   │   └── config.rs           # get_config, set_config
+  │   └── parser/                 # Python AST parsing layer
+  │       ├── mod.rs
+  │       ├── symbols.rs          # Import/def extraction, name resolution
+  │       └── tokens.rs           # Token stream & pattern matching
+  ├── tests/
+  │   ├── mod.rs                  # Integration test entry point
+  │   ├── fixtures.rs             # Fixture management (copy real repos)
+  │   ├── snapshot/               # Expected output comparisons
+  │   │   ├── coderank.py         # Python-side CodeRank for verification
+  │   │   └── hotspots.py         # Python hotspot analysis reference
+  │   └── integration/            # End-to-end tool tests
+  │       ├── test_search.rs
+  │       ├── test_coderank.rs
+  │       ├── test_trace.rs
+  │       ├── test_analysis.rs
+  │       └── test_git.rs
+  └── docs/
+      ├── IMPLEMENTATION.md       # Implementation plan
+      └── SPEC.md                 ← this file  
 ```
 
 ## Components
@@ -77,7 +69,7 @@ search-tools-mcp/
 
 ```toml
 [package]
-name = "rustank"
+name = "rustrank"
 version = "0.1.0"
 edition = "2024"
 description = "RustNative MCP Server — 12 tools for repository analysis"
@@ -142,13 +134,13 @@ git = ["dep:git2"]
 ```rust
 use rmcp::{Handler, Router, Server, service::RpcServiceExt};
 use tokio::net::TcpListener;
-use rustank::context::SharedContext;
-use rustank::router::create_router;
+use rustrank::context::SharedContext;
+use rustrank::router::create_router;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("rustank=info,rmcp=warn")
+        .with_env_filter("rustrank=info,rmcp=warn")
         .init();
 
     // Parse CLI args or environment for transport mode
@@ -165,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // STDIO mode (default)
         let service = Router::new(router).into_service();
-        let server = Server::new().add_module(rustank::tools::ALL_TOOLS);
+        let server = Server::new().add_module(rustrank::tools::ALL_TOOLS);
         server.serve_server(service).await?;
     }
 
