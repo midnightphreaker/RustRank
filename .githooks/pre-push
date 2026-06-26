@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=================================================="
+echo " Rust pre-push checks"
+echo "=================================================="
+
+run_step() {
+  local name="$1"
+  shift
+
+  echo
+  echo "==> ${name}"
+  echo "--------------------------------------------------"
+
+  "$@"
+
+  echo "OK: ${name} passed"
+}
+
+run_step "cargo fmt --check" \
+  cargo fmt --all -- --check
+
+run_step "cargo check" \
+  cargo check --workspace --all-targets --all-features
+
+run_step "cargo clippy" \
+  cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+run_step "cargo test" \
+  cargo test --workspace --all-features
+
+echo
+echo "=================================================="
+echo " All pre-push checks passed"
+echo "=================================================="

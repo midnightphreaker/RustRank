@@ -28,6 +28,12 @@ cargo test --workspace
 cargo clippy --all-targets --all-features
 ```
 
+Install the repository pre-push hook:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 Run the binary in stdio MCP mode:
 
 ```bash

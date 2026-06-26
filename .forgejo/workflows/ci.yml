@@ -1,0 +1,144 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "docs/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "README.md"
+      - ".forgejo/workflows/ci.yml"
+      - ".githooks/pre-push"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: docker
+    container:
+      image: rust:slim-trixie
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            git \
+            jq \
+            nodejs \
+            pkg-config \
+            libssl-dev
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup install 1.95.0
+          rustup default 1.95.0
+          rustup component add clippy rustfmt
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.AUTH_TOKEN }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint with clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Bump version
+        id: bump
+        env:
+          PACKAGE_MANIFEST: src/Cargo.toml
+        run: |
+          CURRENT=$(grep '^version' "${PACKAGE_MANIFEST}" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          IFS='.' read -r major minor patch <<< "$CURRENT"
+          NEW_PATCH=$((patch + 1))
+          NEW_VERSION="${major}.${minor}.${NEW_PATCH}"
+          sed -i "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" "${PACKAGE_MANIFEST}"
+          cargo metadata --format-version 1 >/dev/null
+          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${CURRENT} -> ${NEW_VERSION}"
+
+      - name: Build release binary
+        run: cargo build --release --locked -p rustrank
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          tar czf "dist/rustrank-v${{ steps.bump.outputs.new_version }}-linux-x86_64.tar.gz" \
+            -C target/release rustrank
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            git log "${PREV_TAG}..HEAD" --oneline --format="- %s" > dist/changelog.md
+          else
+            git log --oneline --format="- %s" > dist/changelog.md
+          fi
+          echo "--- Changelog ---"
+          cat dist/changelog.md
+
+      - name: Commit version bump and tag
+        env:
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+        run: |
+          git config user.name "GitBot"
+          git config user.email "GitBot@PHrK.org"
+          NEW_TAG="v${{ steps.bump.outputs.new_version }}"
+          git add src/Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${NEW_TAG} [skip ci]"
+          git tag "$NEW_TAG"
+          HOST="${FORGEJO_SERVER_URL#https://}"
+          HOST="${HOST#http://}"
+          PUSH_URL="https://token:${AUTH_TOKEN}@${HOST}/${FORGEJO_REPOSITORY}"
+          git push "$PUSH_URL" "HEAD:${FORGEJO_REF_NAME}"
+          git push "$PUSH_URL" "$NEW_TAG"
+
+      - name: Create release
+        env:
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+        run: |
+          NEW_TAG="v${{ steps.bump.outputs.new_version }}"
+          CHANGELOG=$(cat dist/changelog.md)
+
+          RESPONSE=$(curl -s -X POST \
+            "${FORGEJO_SERVER_URL}/api/v1/repos/${FORGEJO_REPOSITORY}/releases" \
+            -H "Authorization: token ${AUTH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg tag "$NEW_TAG" \
+              --arg title "$NEW_TAG" \
+              --arg body "$CHANGELOG" \
+              '{tag_name: $tag, name: $title, body: $body, draft: false, prerelease: false}')")
+
+          RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+
+          if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ]; then
+            echo "Failed to create release:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "Created release ${NEW_TAG} (ID: ${RELEASE_ID})"
+
+          ASSET_NAME="rustrank-${NEW_TAG}-linux-x86_64.tar.gz"
+          ASSET_PATH="dist/rustrank-v${{ steps.bump.outputs.new_version }}-linux-x86_64.tar.gz"
+
+          curl -sf -X POST \
+            "${FORGEJO_SERVER_URL}/api/v1/repos/${FORGEJO_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${ASSET_NAME}" \
+            -H "Authorization: token ${AUTH_TOKEN}" \
+            -F "attachment=@${ASSET_PATH}"
+
+          echo ""
+          echo "Release ${NEW_TAG} published with ${ASSET_NAME}"
