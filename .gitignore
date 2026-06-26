@@ -1,0 +1,3 @@
+/target/
+**/target/
+.rustrank_config.json
