@@ -1,4 +1,4 @@
-use rustrank::context::{Context, DefKind};
+use rustrank::context::{Context, DefKind, Language};
 use rustrank::tools::ALL_TOOLS;
 use rustrank::tools::analysis::{error_patterns, exec_paths, perf_bottleneck};
 use rustrank::tools::code_rank::{code_hotspots, coderank_analysis};
@@ -29,6 +29,86 @@ fn context_parse_cache_extracts_imports_and_defs() {
     assert_eq!(first.imports.len(), 2);
     assert!(first.defs.iter().any(|def| def.name == "authenticate"));
     assert!(second.defs.iter().any(|def| def.kind == DefKind::Func));
+}
+
+#[test]
+fn context_parse_all_extracts_supported_languages() {
+    let fixture = fixture();
+    let ctx = Context::new(fixture.path().to_path_buf());
+    let modules = ctx.parse_all().expect("parse all");
+
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.language == Language::Python)
+    );
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.language == Language::Rust)
+    );
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.language == Language::CSharp)
+    );
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.language == Language::TypeScript)
+    );
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.language == Language::JavaScript)
+    );
+
+    let rust = modules
+        .iter()
+        .find(|module| module.path.ends_with("src/lib.rs"))
+        .expect("rust module");
+    assert!(
+        rust.imports
+            .iter()
+            .any(|import| import.module == "crate.service")
+    );
+    assert!(rust.defs.iter().any(|def| def.name == "login_user"));
+
+    let csharp = modules
+        .iter()
+        .find(|module| module.path.ends_with("app/Controller.cs"))
+        .expect("csharp module");
+    assert!(
+        csharp
+            .imports
+            .iter()
+            .any(|import| import.module == "App.Services")
+    );
+    assert!(csharp.defs.iter().any(|def| def.name == "LoginController"));
+
+    let typescript = modules
+        .iter()
+        .find(|module| module.path.ends_with("web/auth.ts"))
+        .expect("typescript module");
+    assert!(
+        typescript
+            .imports
+            .iter()
+            .any(|import| import.module == "./logger")
+    );
+    assert!(typescript.defs.iter().any(|def| def.name == "loginUser"));
+
+    let javascript = modules
+        .iter()
+        .find(|module| module.path.ends_with("web/auth.js"))
+        .expect("javascript module");
+    assert!(
+        javascript
+            .imports
+            .iter()
+            .any(|import| import.module == "./format")
+    );
+    assert!(javascript.defs.iter().any(|def| def.name == "loginBrowser"));
 }
 
 #[test]
@@ -72,6 +152,15 @@ fn smart_code_search_orders_ranked_results() {
 }
 
 #[test]
+fn smart_code_search_finds_supported_language_files() {
+    let fixture = fixture();
+    let rows = smart_code_search(fixture.path().to_str().unwrap(), "loginUser", 1, 10)
+        .expect("smart multi-language");
+
+    assert!(rows.iter().any(|row| row.file.ends_with("web/auth.ts")));
+}
+
+#[test]
 fn api_usage_groups_examples() {
     let fixture = fixture();
     let rows = api_usage(fixture.path().to_str().unwrap(), "authenticate", 10, true).expect("api");
@@ -99,6 +188,45 @@ fn coderank_external_modules_flag_controls_nonlocal_imports() {
 
     assert!(!local_only.iter().any(|row| row.module == "time"));
     assert!(with_external.iter().any(|row| row.module == "time"));
+}
+
+#[test]
+fn coderank_includes_supported_language_modules() {
+    let fixture = fixture();
+    let rows =
+        coderank_analysis(fixture.path().to_str().unwrap(), 50, None, false).expect("rank all");
+
+    assert!(rows.iter().any(|row| row.module == "src.lib"));
+    assert!(rows.iter().any(|row| row.module == "app.Controller"));
+    assert!(rows.iter().any(|row| row.module == "web.auth"));
+}
+
+#[test]
+fn coderank_resolves_local_imports_by_language() {
+    let fixture = fixture();
+    let rows =
+        coderank_analysis(fixture.path().to_str().unwrap(), 50, None, false).expect("rank all");
+
+    assert!(
+        rows.iter()
+            .any(|row| row.module == "pkg.models" && row.depth > 0)
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.module == "src.service" && row.depth > 0)
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.module == "app.AuthService" && row.depth > 0)
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.module == "web.logger" && row.depth > 0)
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.module == "web.format" && row.depth > 0)
+    );
 }
 
 #[test]
@@ -136,6 +264,57 @@ fn trace_dep_impact_finds_dependents() {
 }
 
 #[test]
+fn trace_dep_impact_finds_supported_language_dependents() {
+    let fixture = fixture();
+    let rust_rows =
+        trace_dep_impact(fixture.path().to_str().unwrap(), "crate.service").expect("rust impact");
+    let csharp_rows =
+        trace_dep_impact(fixture.path().to_str().unwrap(), "App.Services").expect("csharp impact");
+    let ts_rows =
+        trace_dep_impact(fixture.path().to_str().unwrap(), "./logger").expect("ts impact");
+    let js_rows =
+        trace_dep_impact(fixture.path().to_str().unwrap(), "./format").expect("js impact");
+
+    assert!(rust_rows.iter().any(|row| row.file.ends_with("src/lib.rs")));
+    assert!(
+        csharp_rows
+            .iter()
+            .any(|row| row.file.ends_with("app/Controller.cs"))
+    );
+    assert!(ts_rows.iter().any(|row| row.file.ends_with("web/auth.ts")));
+    assert!(js_rows.iter().any(|row| row.file.ends_with("web/auth.js")));
+}
+
+#[test]
+fn trace_dep_impact_accepts_canonical_resolved_modules() {
+    let fixture = fixture();
+    let py_rows =
+        trace_dep_impact(fixture.path().to_str().unwrap(), "pkg.models").expect("python impact");
+    let rust_rows =
+        trace_dep_impact(fixture.path().to_str().unwrap(), "src.service").expect("rust impact");
+    let csharp_rows = trace_dep_impact(fixture.path().to_str().unwrap(), "app.AuthService")
+        .expect("csharp impact");
+    let ts_rows =
+        trace_dep_impact(fixture.path().to_str().unwrap(), "web.logger").expect("ts impact");
+    let js_rows =
+        trace_dep_impact(fixture.path().to_str().unwrap(), "web.format").expect("js impact");
+
+    assert!(
+        py_rows
+            .iter()
+            .any(|row| row.file.ends_with("pkg/relative.py"))
+    );
+    assert!(rust_rows.iter().any(|row| row.file.ends_with("src/lib.rs")));
+    assert!(
+        csharp_rows
+            .iter()
+            .any(|row| row.file.ends_with("app/Controller.cs"))
+    );
+    assert!(ts_rows.iter().any(|row| row.file.ends_with("web/auth.ts")));
+    assert!(js_rows.iter().any(|row| row.file.ends_with("web/auth.js")));
+}
+
+#[test]
 fn error_patterns_detects_error_handling() {
     let fixture = fixture();
     let rows = error_patterns(fixture.path().to_str().unwrap(), true, false, None).expect("errors");
@@ -167,6 +346,24 @@ fn exec_paths_finds_branches() {
     let rows = exec_paths(fixture.path().to_str().unwrap(), "login", 4, true).expect("paths");
 
     assert!(rows.iter().any(|row| row.kind == "branch"));
+}
+
+#[test]
+fn exec_paths_finds_supported_language_branches() {
+    let fixture = fixture();
+    let rust_rows =
+        exec_paths(fixture.path().to_str().unwrap(), "login_user", 4, true).expect("rust paths");
+    let csharp_rows =
+        exec_paths(fixture.path().to_str().unwrap(), "Login", 4, true).expect("csharp paths");
+    let ts_rows =
+        exec_paths(fixture.path().to_str().unwrap(), "loginUser", 4, true).expect("ts paths");
+    let js_rows =
+        exec_paths(fixture.path().to_str().unwrap(), "loginBrowser", 4, true).expect("js paths");
+
+    assert!(rust_rows.iter().any(|row| row.kind == "branch"));
+    assert!(csharp_rows.iter().any(|row| row.kind == "branch"));
+    assert!(ts_rows.iter().any(|row| row.kind == "branch"));
+    assert!(js_rows.iter().any(|row| row.kind == "branch"));
 }
 
 #[test]

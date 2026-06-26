@@ -16,8 +16,8 @@ pub enum AppError {
     },
     #[error("Not a git repository: {0}")]
     NotAGit(PathBuf),
-    #[error("No Python source found in {0}")]
-    NoPythonSource(PathBuf),
+    #[error("No supported source found in {0}")]
+    NoSource(PathBuf),
     #[error("Graph error: {0}")]
     Graph(String),
     #[error("Context error: {0}")]

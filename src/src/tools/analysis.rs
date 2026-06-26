@@ -5,12 +5,12 @@ use std::{
 };
 
 use crate::{
-    context::{Context, DefKind},
+    context::{Context, DefKind, supported_source_files},
     error::{AppError, Result},
     fmt::AnalysisRow,
 };
 
-use super::search::{rel, source_files, validate_dir};
+use super::search::{rel, validate_dir};
 
 pub fn error_patterns(
     repo_path: &str,
@@ -18,7 +18,7 @@ pub fn error_patterns(
     show_evolution: bool,
     days_back: Option<u32>,
 ) -> Result<Vec<AnalysisRow>> {
-    let mut rows = scan_py(repo_path, |file, line_no, line| {
+    let mut rows = scan_supported_sources(repo_path, |file, line_no, line| {
         let trimmed = line.trim();
         let pattern = if trimmed.starts_with("try:") {
             Some(("try", "info"))
@@ -26,6 +26,8 @@ pub fn error_patterns(
             Some(("except", "info"))
         } else if trimmed.starts_with("raise ") {
             Some(("raise", "warning"))
+        } else if trimmed.starts_with("throw ") {
+            Some(("throw", "warning"))
         } else if include_antipatterns
             && (trimmed.contains("unwrap(") || trimmed.contains("panic!("))
         {
@@ -60,7 +62,7 @@ pub fn perf_bottleneck(
     } else {
         focus_areas.to_vec()
     };
-    scan_py(repo_path, |file, line_no, line| {
+    scan_supported_sources(repo_path, |file, line_no, line| {
         let trimmed = line.trim();
         if !include_utility && file.contains("util") {
             return None;
@@ -148,14 +150,14 @@ pub fn execute_paths(
     exec_paths(repo_path, function_name, max_depth, include_call_contexts)
 }
 
-fn scan_py(
+fn scan_supported_sources(
     repo_path: &str,
     mut f: impl FnMut(String, usize, &str) -> Option<AnalysisRow>,
 ) -> Result<Vec<AnalysisRow>> {
     let root = Path::new(repo_path);
     validate_dir(root)?;
     let mut rows = Vec::new();
-    for file in source_files(root, Some("py"))? {
+    for (file, _) in supported_source_files(root)? {
         let source = std::fs::read_to_string(&file)?;
         for (idx, line) in source.lines().enumerate() {
             if let Some(row) = f(rel(root, &file), idx + 1, line) {
@@ -181,7 +183,7 @@ fn git_evolution_rows(repo_path: &str, days_back: Option<u32>) -> Result<Vec<Ana
     });
     let mut rows = Vec::new();
 
-    for file in source_files(root, Some("py"))? {
+    for (file, _) in supported_source_files(root)? {
         let rel_workdir = file
             .strip_prefix(workdir)
             .map_err(|err| AppError::Context(err.to_string()))?;

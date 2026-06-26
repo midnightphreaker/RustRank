@@ -4,6 +4,7 @@ use regex::Regex;
 use walkdir::WalkDir;
 
 use crate::{
+    context::Language,
     error::{AppError, Result},
     fmt::{ApiUsageRow, SearchRow},
 };
@@ -53,7 +54,10 @@ pub fn smart_code_search(
     context_lines: usize,
     num_context_lines: usize,
 ) -> Result<Vec<SearchRow>> {
-    let mut rows = contextual_search(repo_path, pattern, Some("py"), false, context_lines)?;
+    let mut rows = contextual_search(repo_path, pattern, None, false, context_lines)?
+        .into_iter()
+        .filter(|row| Language::from_path(Path::new(&row.file)).is_some())
+        .collect::<Vec<_>>();
     let ranks = code_rank::coderank_map(repo_path)?;
     for row in &mut rows {
         let module = module_from_file(&row.file);
@@ -75,7 +79,10 @@ pub fn api_usage(
     max_examples: usize,
     group_by_pattern: bool,
 ) -> Result<Vec<ApiUsageRow>> {
-    let rows = contextual_search(repo_path, api_name, Some("py"), false, 0)?;
+    let rows = contextual_search(repo_path, api_name, None, false, 0)?
+        .into_iter()
+        .filter(|row| Language::from_path(Path::new(&row.file)).is_some())
+        .collect::<Vec<_>>();
     let mut usage = rows
         .into_iter()
         .map(|row| {
@@ -113,7 +120,12 @@ pub(crate) fn source_files(root: &Path, file_type: Option<&str>) -> Result<Vec<P
             continue;
         }
         let path = entry.path();
-        if path.components().any(|part| part.as_os_str() == ".git") {
+        if path.components().any(|part| {
+            matches!(
+                part.as_os_str().to_string_lossy().as_ref(),
+                ".git" | "target" | "node_modules" | "dist" | "build"
+            )
+        }) {
             continue;
         }
         if let Some(ext) = normalized_ext
@@ -145,7 +157,12 @@ pub(crate) fn rel(root: &Path, file: &Path) -> String {
 }
 
 pub(crate) fn module_from_file(file: &str) -> String {
-    let without_ext = file.strip_suffix(".py").unwrap_or(file);
+    let without_ext = [
+        ".py", ".rs", ".cs", ".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs",
+    ]
+    .iter()
+    .find_map(|ext| file.strip_suffix(ext))
+    .unwrap_or(file);
     without_ext
         .trim_end_matches("/__init__")
         .replace(['/', '\\'], ".")

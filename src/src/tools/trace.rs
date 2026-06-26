@@ -3,12 +3,12 @@ use std::path::Path;
 use regex::Regex;
 
 use crate::{
-    context::{Context, module_name_from_path},
+    context::{Context, LocalModuleResolver, supported_source_files},
     error::Result,
     fmt::TraceRow,
 };
 
-use super::search::{rel, source_files, validate_dir};
+use super::search::{rel, validate_dir};
 
 pub fn trace_data_flow(
     repo_path: &str,
@@ -62,7 +62,7 @@ pub fn trace_feature_impl(repo_path: &str, feature_keywords: &[&str]) -> Result<
     let root = Path::new(repo_path);
     validate_dir(root)?;
     let mut rows = Vec::new();
-    for file in source_files(root, Some("py"))? {
+    for (file, _) in supported_source_files(root)? {
         let source = std::fs::read_to_string(&file)?;
         for (idx, line) in source.lines().enumerate() {
             let lower = line.to_lowercase();
@@ -89,11 +89,12 @@ pub fn trace_dep_impact(repo_path: &str, target_module: &str) -> Result<Vec<Trac
     validate_dir(root)?;
     let ctx = Context::new(root.to_path_buf());
     let modules = ctx.parse_all()?;
+    let resolver = LocalModuleResolver::new(&modules);
     let mut rows = Vec::new();
-    for module in modules {
-        let dependent = module_name_from_path(&module.path);
+    for module in &modules {
+        let dependent = resolver.module_name_for(module);
         for import in &module.imports {
-            if import_targets(import, target_module) {
+            if resolver.import_matches_target(module, import, target_module) {
                 let snippet = module
                     .source_lines
                     .get(import.line.saturating_sub(1))
@@ -111,16 +112,6 @@ pub fn trace_dep_impact(repo_path: &str, target_module: &str) -> Result<Vec<Trac
         }
     }
     Ok(rows)
-}
-
-fn import_targets(import: &crate::context::Import, target_module: &str) -> bool {
-    if import.module == target_module || import.module.starts_with(&format!("{target_module}.")) {
-        return true;
-    }
-    if let Some((parent, name)) = target_module.rsplit_once('.') {
-        return import.module == parent && import.name.as_deref() == Some(name);
-    }
-    import.name.as_deref() == Some(target_module)
 }
 
 fn layer_for_file(file: &str) -> String {

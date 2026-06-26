@@ -6,7 +6,7 @@ use std::{
 use graphops::{AdjacencyMatrix, PageRankConfig, pagerank};
 
 use crate::{
-    context::{Context, ModuleDef, module_name_from_path},
+    context::{Context, LocalModuleResolver, ModuleDef, supported_source_files},
     error::{AppError, Result},
     fmt::{CodeRankRow, HotspotRow},
 };
@@ -90,10 +90,8 @@ struct ImportGraph {
 }
 
 fn build_graph(modules: &[ModuleDef], include_external: bool) -> ImportGraph {
-    let mut module_names = modules
-        .iter()
-        .map(|module| module_name_from_path(&module.path))
-        .collect::<Vec<_>>();
+    let resolver = LocalModuleResolver::new(modules);
+    let mut module_names = resolver.module_names().to_vec();
 
     let mut index = module_names
         .iter()
@@ -105,7 +103,7 @@ fn build_graph(modules: &[ModuleDef], include_external: bool) -> ImportGraph {
         for module in modules {
             for import in &module.imports {
                 if !import.module.is_empty()
-                    && resolve_import(&import.module, &index).is_none()
+                    && resolver.resolve_import_targets(module, import).is_empty()
                     && !index.contains_key(&import.module)
                 {
                     let idx = module_names.len();
@@ -120,9 +118,19 @@ fn build_graph(modules: &[ModuleDef], include_external: bool) -> ImportGraph {
     let mut outgoing = vec![HashSet::new(); module_names.len()];
     let mut incoming = vec![HashSet::new(); module_names.len()];
 
-    for (source_idx, module) in modules.iter().enumerate() {
+    for module in modules {
+        let Some(source_idx) = resolver.module_index(&resolver.module_name_for(module)) else {
+            continue;
+        };
         for import in &module.imports {
-            if let Some(target_idx) = resolve_import(&import.module, &index) {
+            let mut targets = resolver.resolve_import_targets(module, import);
+            if targets.is_empty() && include_external && !import.module.is_empty() {
+                targets.push(import.module.clone());
+            }
+            for target in targets {
+                let Some(target_idx) = index.get(&target).copied() else {
+                    continue;
+                };
                 matrix[source_idx][target_idx] = 1.0;
                 outgoing[source_idx].insert(target_idx);
                 incoming[target_idx].insert(source_idx);
@@ -149,26 +157,11 @@ fn build_graph(modules: &[ModuleDef], include_external: bool) -> ImportGraph {
     }
 }
 
-fn resolve_import(import: &str, index: &HashMap<String, usize>) -> Option<usize> {
-    if let Some(idx) = index.get(import) {
-        return Some(*idx);
-    }
-    let mut parts = import.split('.').collect::<Vec<_>>();
-    while parts.len() > 1 {
-        parts.pop();
-        let candidate = parts.join(".");
-        if let Some(idx) = index.get(&candidate) {
-            return Some(*idx);
-        }
-    }
-    None
-}
-
 fn textual_frequency(repo_path: &str, module: &str) -> Result<usize> {
     let root = Path::new(repo_path);
     let last = module.rsplit('.').next().unwrap_or(module);
     let mut count = 0;
-    for file in crate::context::python_files(root)? {
+    for (file, _) in supported_source_files(root)? {
         let source = std::fs::read_to_string(file)?;
         count += source.matches(module).count();
         count += source.matches(last).count();
