@@ -15,6 +15,7 @@ from urllib import error, request
 PROTOCOL_VERSION = "2025-06-18"
 
 EXPECTED_TOOLS = [
+    "index_project",
     "contextual_search",
     "smart_code_search",
     "api_usage",
@@ -296,7 +297,27 @@ def call_tool(url: str, request_id: int, name: str, arguments: dict) -> None:
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict) and parsed.get("error"):
+                raise SmokeFailure(f"{name} returned RustRank error: {parsed['error']}")
+
+
+def call_tool_json(url: str, request_id: int, name: str, arguments: dict) -> object:
+    result = rpc(url, "tools/call", {"name": name, "arguments": arguments}, request_id)
+    if result.get("isError"):
+        raise SmokeFailure(f"{name} returned MCP tool error: {result}")
+
+    for item in result.get("content", []):
+        if item.get("type") != "text":
+            continue
+        text = item.get("text", "")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("error"):
             raise SmokeFailure(f"{name} returned RustRank error: {parsed['error']}")
+        return parsed
+
+    raise SmokeFailure(f"{name} returned no JSON text content")
 
 
 def tool_calls(repo_path: str) -> list[tuple[str, dict]]:
@@ -402,7 +423,7 @@ def tool_calls(repo_path: str) -> list[tuple[str, dict]]:
     ]
 
 
-def run_smoke(url: str, repo_path: str) -> None:
+def run_smoke(url: str, repo_path: str, fixture_dir: Path | None = None) -> None:
     request_id = 1
     rpc(
         url,
@@ -423,6 +444,38 @@ def run_smoke(url: str, repo_path: str) -> None:
     unexpected = sorted(set(names) - set(EXPECTED_TOOLS))
     if missing or unexpected:
         raise SmokeFailure(f"tool list mismatch, missing={missing}, unexpected={unexpected}")
+
+    index_result = call_tool_json(
+        url,
+        request_id,
+        "index_project",
+        {
+            "repo_path": repo_path,
+            "languages": None,
+            "force_rebuild": True,
+            "clean_stale": True,
+        },
+    )
+    request_id += 1
+    if not isinstance(index_result, dict):
+        raise SmokeFailure(f"index_project returned unexpected result: {index_result}")
+    if index_result.get("indexed_files", 0) <= 0:
+        raise SmokeFailure(f"index_project indexed no files: {index_result}")
+    if not str(index_result.get("project_manifest", "")).endswith(
+        ".rustrank/index/v1/project_manifest.json"
+    ):
+        raise SmokeFailure(f"index_project returned unexpected manifest: {index_result}")
+    if fixture_dir is not None:
+        agents_path = fixture_dir / "AGENTS.md"
+        if not agents_path.exists():
+            raise SmokeFailure("index_project did not create AGENTS.md")
+        agents = agents_path.read_text()
+        if (
+            "<!-- rustrank-index:start -->" not in agents
+            or "<!-- rustrank-index:end -->" not in agents
+            or "## RustRank Indexed Codebase" not in agents
+        ):
+            raise SmokeFailure("index_project AGENTS.md section is missing or malformed")
 
     for name, arguments in tool_calls(repo_path):
         call_tool(url, request_id, name, arguments)
@@ -454,13 +507,13 @@ def main() -> int:
             fixture_dir = Path(args.fixture_dir).resolve()
             write_fixture(fixture_dir)
             maybe_commit_fixture(fixture_dir)
-            run_smoke(args.url, args.repo_path or str(fixture_dir))
+            run_smoke(args.url, args.repo_path or str(fixture_dir), fixture_dir)
         else:
             with tempfile.TemporaryDirectory(prefix="rustrank-smoke-") as tmp:
                 fixture_dir = Path(tmp)
                 write_fixture(fixture_dir)
                 maybe_commit_fixture(fixture_dir)
-                run_smoke(args.url, args.repo_path or str(fixture_dir))
+                run_smoke(args.url, args.repo_path or str(fixture_dir), fixture_dir)
     except SmokeFailure as exc:
         print(f"smoke test failed: {exc}", file=sys.stderr)
         return 1

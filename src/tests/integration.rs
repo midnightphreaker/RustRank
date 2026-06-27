@@ -1,8 +1,9 @@
-use rustrank::context::{Context, DefKind, Language};
+use rustrank::context::{Context, DefKind, Language, supported_source_files};
 use rustrank::tools::ALL_TOOLS;
 use rustrank::tools::analysis::{error_patterns, exec_paths, perf_bottleneck};
 use rustrank::tools::code_rank::{code_hotspots, coderank_analysis};
 use rustrank::tools::config::{get_config, set_config};
+use rustrank::tools::index::index_project;
 use rustrank::tools::search::{api_usage, contextual_search, smart_code_search};
 use rustrank::tools::trace::{trace_data_flow, trace_dep_impact, trace_feature_impl};
 
@@ -11,10 +12,57 @@ mod fixtures;
 use fixtures::fixture;
 
 #[test]
-fn router_registers_fourteen_tools() {
-    assert_eq!(ALL_TOOLS.len(), 14);
+fn router_registers_fifteen_tools() {
+    assert_eq!(ALL_TOOLS.len(), 15);
     assert!(ALL_TOOLS.contains(&"exec_paths"));
     assert!(ALL_TOOLS.contains(&"execute_paths"));
+    assert!(ALL_TOOLS.contains(&"index_project"));
+}
+
+#[test]
+fn language_from_path_recognizes_all_supported_extensions() {
+    assert_eq!(
+        Language::from_path(std::path::Path::new("pkg/core.py")),
+        Some(Language::Python)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("src/lib.rs")),
+        Some(Language::Rust)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("app/Controller.cs")),
+        Some(Language::CSharp)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("web/auth.ts")),
+        Some(Language::TypeScript)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("web/view.tsx")),
+        Some(Language::TypeScript)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("web/auth.js")),
+        Some(Language::JavaScript)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("web/view.jsx")),
+        Some(Language::JavaScript)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("web/browser.mjs")),
+        Some(Language::JavaScript)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("web/legacy.cjs")),
+        Some(Language::JavaScript)
+    );
+    assert_eq!(Language::from_path(std::path::Path::new("README.md")), None);
+    assert_eq!(
+        Language::from_path(std::path::Path::new("package.json")),
+        None
+    );
+    assert_eq!(Language::from_path(std::path::Path::new("Makefile")), None);
 }
 
 #[test]
@@ -109,6 +157,24 @@ fn context_parse_all_extracts_supported_languages() {
             .any(|import| import.module == "./format")
     );
     assert!(javascript.defs.iter().any(|def| def.name == "loginBrowser"));
+}
+
+#[test]
+fn supported_source_files_ignores_persistent_rustrank_data() {
+    let fixture = fixture();
+    let data_dir = fixture
+        .path()
+        .join(".rustrank/index/v1/languages/python/files");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    std::fs::write(data_dir.join("fake.py"), "def should_not_parse(): pass").expect("cache file");
+
+    let files = supported_source_files(fixture.path()).expect("source files");
+
+    assert!(
+        !files
+            .iter()
+            .any(|(path, _)| path.to_string_lossy().contains(".rustrank"))
+    );
 }
 
 #[test]
@@ -226,6 +292,231 @@ fn coderank_resolves_local_imports_by_language() {
     assert!(
         rows.iter()
             .any(|row| row.module == "web.format" && row.depth > 0)
+    );
+}
+
+#[test]
+fn enabled_language_config_filters_parse_and_tools() {
+    let fixture = fixture();
+    set_config(
+        fixture.path().to_str().unwrap(),
+        "languages",
+        serde_json::json!({ "enabled": ["python", "rust"] }),
+    )
+    .expect("set languages");
+
+    let ctx = Context::new(fixture.path().to_path_buf());
+    let modules = ctx.parse_all().expect("parse filtered");
+
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.language == Language::Python)
+    );
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.language == Language::Rust)
+    );
+    assert!(
+        !modules
+            .iter()
+            .any(|module| module.language == Language::CSharp)
+    );
+    assert!(
+        !modules
+            .iter()
+            .any(|module| matches!(module.language, Language::TypeScript | Language::JavaScript))
+    );
+
+    let rank_rows =
+        coderank_analysis(fixture.path().to_str().unwrap(), 50, None, false).expect("rank");
+    assert!(rank_rows.iter().any(|row| row.module == "pkg.core"));
+    assert!(rank_rows.iter().any(|row| row.module == "src.lib"));
+    assert!(!rank_rows.iter().any(|row| row.module.starts_with("app.")));
+    assert!(!rank_rows.iter().any(|row| row.module.starts_with("web.")));
+}
+
+#[test]
+fn index_project_generates_language_shards_and_project_manifest() {
+    let fixture = fixture();
+
+    let summary =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+
+    assert!(summary.scanned_files >= 10);
+    assert_eq!(summary.indexed_files, summary.scanned_files);
+    assert!(summary.cache_misses > 0);
+    assert!(
+        summary
+            .project_manifest
+            .ends_with(".rustrank/index/v1/project_manifest.json")
+    );
+
+    let manifest_path = fixture
+        .path()
+        .join(".rustrank/index/v1/project_manifest.json");
+    assert!(manifest_path.exists());
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest_path).expect("manifest"))
+            .expect("manifest json");
+    assert_eq!(manifest["header"]["schema_version"], 1);
+    assert!(manifest["languages"].as_array().unwrap().len() >= 5);
+    assert!(
+        manifest["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |edge| edge["source_module"] == "pkg.core" && edge["target_module"] == "pkg.models"
+            )
+    );
+
+    let cache_text = std::fs::read_to_string(
+        fixture
+            .path()
+            .join(".rustrank/index/v1/languages/python/index.json"),
+    )
+    .expect("python shard");
+    assert!(!cache_text.contains("source_lines"));
+    assert!(!cache_text.contains(fixture.path().to_str().unwrap()));
+}
+
+#[test]
+fn index_project_creates_agents_md_with_index_summary() {
+    let fixture = fixture();
+
+    index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+
+    let agents_path = fixture.path().join("AGENTS.md");
+    let agents = std::fs::read_to_string(agents_path).expect("agents file");
+    assert!(agents.contains("# AGENTS.md"));
+    assert!(agents.contains("## RustRank Indexed Codebase"));
+    assert!(agents.contains("Persistent index cache: `.rustrank/index/v1/`"));
+    assert!(agents.contains("Project manifest: `.rustrank/index/v1/project_manifest.json`"));
+    assert!(agents.contains("| python |"));
+    assert!(agents.contains("| rust |"));
+    assert!(agents.contains("| csharp |"));
+    assert!(agents.contains("| typescript |"));
+    assert!(agents.contains("| javascript |"));
+}
+
+#[test]
+fn index_project_amends_existing_agents_md_without_duplicating_section() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.path().join("AGENTS.md"),
+        "# AGENTS.md\n\nKeep this instruction.\n\n<!-- rustrank-index:start -->\nold summary\n<!-- rustrank-index:end -->\n",
+    )
+    .expect("seed agents file");
+
+    index_project(fixture.path().to_str().unwrap(), None, true, true).expect("first index");
+    index_project(fixture.path().to_str().unwrap(), None, false, true).expect("second index");
+
+    let agents = std::fs::read_to_string(fixture.path().join("AGENTS.md")).expect("agents file");
+    assert!(agents.contains("Keep this instruction."));
+    assert!(!agents.contains("old summary"));
+    assert_eq!(agents.matches("<!-- rustrank-index:start -->").count(), 1);
+    assert_eq!(agents.matches("<!-- rustrank-index:end -->").count(), 1);
+    assert_eq!(agents.matches("## RustRank Indexed Codebase").count(), 1);
+}
+
+#[test]
+fn index_project_reuses_unchanged_file_hashes() {
+    let fixture = fixture();
+    let first =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("first index");
+    let second =
+        index_project(fixture.path().to_str().unwrap(), None, false, true).expect("second index");
+
+    assert_eq!(first.scanned_files, second.scanned_files);
+    assert!(second.cache_hits > 0);
+    assert_eq!(second.cache_misses, 0);
+
+    std::fs::write(
+        fixture.path().join("pkg/models.py"),
+        r#"
+class User:
+    def __init__(self, user_id, email):
+        self.user_id = user_id
+        self.email = email
+
+def model_version():
+    return "changed"
+"#,
+    )
+    .expect("modify model");
+    let third =
+        index_project(fixture.path().to_str().unwrap(), None, false, true).expect("third index");
+
+    assert_eq!(third.scanned_files, second.scanned_files);
+    assert!(third.cache_hits > 0);
+    assert_eq!(third.cache_misses, 1);
+}
+
+#[test]
+fn index_project_rebuilds_corrupt_cache_file() {
+    let fixture = fixture();
+    let first =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("first index");
+    assert!(first.cache_misses > 0);
+
+    let python_file = first
+        .languages
+        .iter()
+        .find(|summary| summary.language == Language::Python)
+        .expect("python summary");
+    let index_path = fixture.path().join(&python_file.index_file);
+    let shard: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(index_path).expect("language index"))
+            .expect("language shard json");
+    let cache_file = shard["files"][0]["cache_file"]
+        .as_str()
+        .expect("cache file path");
+    std::fs::write(fixture.path().join(cache_file), "{ definitely not json").expect("corrupt");
+
+    let rebuilt =
+        index_project(fixture.path().to_str().unwrap(), None, false, true).expect("rebuild index");
+
+    assert_eq!(rebuilt.scanned_files, first.scanned_files);
+    assert_eq!(rebuilt.cache_misses, 1);
+}
+
+#[test]
+fn cli_index_project_generates_manifest_json() {
+    let fixture = fixture();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rustrank"))
+        .args([
+            "index-project",
+            "--repo-path",
+            fixture.path().to_str().unwrap(),
+            "--force-rebuild",
+            "--clean-stale",
+        ])
+        .output()
+        .expect("run index cli");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cli json response");
+    assert!(summary["indexed_files"].as_u64().unwrap() > 0);
+    assert!(
+        summary["project_manifest"]
+            .as_str()
+            .unwrap()
+            .ends_with(".rustrank/index/v1/project_manifest.json")
+    );
+    assert!(
+        fixture
+            .path()
+            .join(".rustrank/index/v1/project_manifest.json")
+            .exists()
     );
 }
 

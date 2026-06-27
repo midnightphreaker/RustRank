@@ -195,5 +195,29 @@ export const formatUser = (userId) => ({ userId });
 "#,
     )
     .expect("jsx format");
+    fs::write(
+        root.join("web/legacy.cjs"),
+        r#"
+const { formatUser } = require("./format");
+
+function legacyLogin(userId) {
+    return formatUser(userId);
+}
+
+module.exports = { legacyLogin };
+"#,
+    )
+    .expect("cjs legacy");
+    fs::write(
+        root.join("web/browser.mjs"),
+        r#"
+import { formatUser } from "./format.jsx";
+
+export function browserLogin(userId) {
+    return formatUser(userId);
+}
+"#,
+    )
+    .expect("mjs browser");
     dir
 }

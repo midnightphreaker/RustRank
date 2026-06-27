@@ -9,9 +9,13 @@ use rustpython_parser::{
     Parse,
     ast::{self, Ranged},
 };
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
-use crate::error::{AppError, Result};
+use crate::{
+    error::{AppError, Result},
+    project_config,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleDef {
@@ -20,39 +24,90 @@ pub struct ModuleDef {
     pub imports: Vec<Import>,
     pub defs: Vec<Definition>,
     pub source_lines: Vec<String>,
+    pub declared_namespaces: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Language {
     Python,
     Rust,
+    #[serde(rename = "csharp")]
     CSharp,
     TypeScript,
     JavaScript,
 }
 
 impl Language {
+    pub const ALL: [Self; 5] = [
+        Self::Python,
+        Self::Rust,
+        Self::CSharp,
+        Self::TypeScript,
+        Self::JavaScript,
+    ];
+
     pub fn from_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
-        match ext.as_str() {
-            "py" => Some(Self::Python),
-            "rs" => Some(Self::Rust),
-            "cs" => Some(Self::CSharp),
-            "ts" | "tsx" => Some(Self::TypeScript),
-            "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+        let path = path.to_string_lossy().to_ascii_lowercase();
+        if path.ends_with(".tsx") || path.ends_with(".ts") {
+            Some(Self::TypeScript)
+        } else if path.ends_with(".jsx")
+            || path.ends_with(".mjs")
+            || path.ends_with(".cjs")
+            || path.ends_with(".js")
+        {
+            Some(Self::JavaScript)
+        } else if path.ends_with(".py") {
+            Some(Self::Python)
+        } else if path.ends_with(".rs") {
+            Some(Self::Rust)
+        } else if path.ends_with(".cs") {
+            Some(Self::CSharp)
+        } else {
+            None
+        }
+    }
+
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Rust => "rust",
+            Self::CSharp => "csharp",
+            Self::TypeScript => "typescript",
+            Self::JavaScript => "javascript",
+        }
+    }
+
+    pub fn from_config_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "python" | "py" => Some(Self::Python),
+            "rust" | "rs" => Some(Self::Rust),
+            "csharp" | "c#" | "cs" => Some(Self::CSharp),
+            "typescript" | "ts" | "tsx" => Some(Self::TypeScript),
+            "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
             _ => None,
+        }
+    }
+
+    pub fn order(self) -> usize {
+        match self {
+            Self::Python => 0,
+            Self::Rust => 1,
+            Self::CSharp => 2,
+            Self::TypeScript => 3,
+            Self::JavaScript => 4,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Import {
     pub module: String,
     pub name: Option<String>,
     pub line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Definition {
     pub name: String,
     pub kind: DefKind,
@@ -61,7 +116,8 @@ pub struct Definition {
     pub has_args: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DefKind {
     Func,
     Struct,
@@ -140,6 +196,7 @@ impl Context {
             imports,
             defs,
             source_lines,
+            declared_namespaces: declared_namespaces(language, &source),
         };
 
         self.parse_cache
@@ -161,6 +218,10 @@ impl Context {
 }
 
 pub fn supported_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
+    enabled_source_files(root)
+}
+
+pub fn all_supported_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
     let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry?;
@@ -177,6 +238,33 @@ pub fn supported_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
+}
+
+pub fn enabled_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
+    let enabled = project_config::enabled_languages(root)?;
+    Ok(all_supported_source_files(root)?
+        .into_iter()
+        .filter(|(_, language)| enabled.contains(language))
+        .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguageCount {
+    pub language: Language,
+    pub count: usize,
+}
+
+pub fn detect_languages(root: &Path) -> Result<Vec<LanguageCount>> {
+    let mut counts = HashMap::<Language, usize>::new();
+    for (_, language) in all_supported_source_files(root)? {
+        *counts.entry(language).or_default() += 1;
+    }
+    let mut rows = counts
+        .into_iter()
+        .map(|(language, count)| LanguageCount { language, count })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.language.order());
+    Ok(rows)
 }
 
 pub fn python_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -469,7 +557,7 @@ fn rust_module_aliases(module_name: &str) -> Vec<String> {
 }
 
 fn csharp_module_aliases(module: &ModuleDef, module_name: &str) -> Vec<String> {
-    let namespaces = csharp_namespaces(module);
+    let namespaces = module.declared_namespaces.clone();
     let mut aliases = Vec::new();
     for namespace in namespaces {
         aliases.push(namespace.clone());
@@ -481,9 +569,12 @@ fn csharp_module_aliases(module: &ModuleDef, module_name: &str) -> Vec<String> {
     aliases
 }
 
-fn csharp_namespaces(module: &ModuleDef) -> Vec<String> {
+fn declared_namespaces(language: Language, source: &str) -> Vec<String> {
+    if language != Language::CSharp {
+        return Vec::new();
+    }
     let mut namespaces = Vec::new();
-    for line in &module.source_lines {
+    for line in source.lines() {
         let trimmed = line.trim();
         let Some(rest) = trimmed.strip_prefix("namespace ") else {
             continue;
@@ -554,7 +645,7 @@ fn is_ignored_path(path: &Path) -> bool {
     path.components().any(|part| {
         matches!(
             part.as_os_str().to_string_lossy().as_ref(),
-            ".git" | "target" | "node_modules" | "dist" | "build"
+            ".git" | ".rustrank" | "target" | "node_modules" | "dist" | "build"
         )
     })
 }

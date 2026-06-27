@@ -7,6 +7,7 @@ description = "RustRank MCP server for repository analysis"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+blake3 = "1"
 git2 = "0.20"
 graphops = "=0.4.1"
 grep = "0.3"

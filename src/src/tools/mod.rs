@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod code_rank;
 pub mod config;
+pub mod index;
 pub mod search;
 pub mod trace;
 
@@ -24,6 +25,7 @@ const DEFAULT_MCP_PATH: &str = "/mcp";
 const HEALTH_PATH: &str = "/healthz";
 
 pub const ALL_TOOLS: &[&str] = &[
+    "index_project",
     "contextual_search",
     "smart_code_search",
     "api_usage",
@@ -154,8 +156,28 @@ struct SetConfigRequest {
     value: serde_json::Value,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct IndexProjectRequest {
+    repo_path: String,
+    languages: Option<Vec<String>>,
+    force_rebuild: bool,
+    clean_stale: bool,
+}
+
 #[tool_router]
 impl RustRankRouter {
+    #[tool(
+        description = "Index a repository into persistent per-language caches and a project manifest"
+    )]
+    fn index_project(&self, Parameters(req): Parameters<IndexProjectRequest>) -> String {
+        json(index::index_project(
+            &req.repo_path,
+            req.languages,
+            req.force_rebuild,
+            req.clean_stale,
+        ))
+    }
+
     #[tool(description = "Search repository files for a pattern with line context")]
     fn contextual_search(&self, Parameters(req): Parameters<ContextualSearchRequest>) -> String {
         json(search::contextual_search(
@@ -300,12 +322,84 @@ pub fn serve() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if std::env::args().nth(1).as_deref() == Some("index-project") {
+        return run_index_project_cli();
+    }
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         match transport_from_env() {
             Transport::StreamableHttp => serve_streamable_http().await,
             Transport::Stdio => serve_stdio().await,
         }
+    })
+}
+
+fn run_index_project_cli() -> anyhow::Result<()> {
+    match parse_index_project_cli(std::env::args().skip(2).collect()) {
+        Ok(req) => {
+            let response = index::index_project(
+                &req.repo_path,
+                req.languages,
+                req.force_rebuild,
+                req.clean_stale,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
+        Err(message) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "error": true,
+                    "code": "INVALID_ARGUMENTS",
+                    "message": message,
+                    "suggestion": "usage: rustrank index-project --repo-path <path> [--languages python,rust] [--force-rebuild] [--clean-stale]"
+                })
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_index_project_cli(args: Vec<String>) -> std::result::Result<IndexProjectRequest, String> {
+    let mut repo_path = None;
+    let mut languages = None;
+    let mut force_rebuild = false;
+    let mut clean_stale = false;
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--repo-path" => {
+                repo_path = Some(
+                    iter.next()
+                        .ok_or_else(|| "--repo-path requires a value".to_string())?,
+                );
+            }
+            "--languages" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--languages requires a comma-separated value".to_string())?;
+                languages = Some(
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                );
+            }
+            "--force-rebuild" => force_rebuild = true,
+            "--clean-stale" => clean_stale = true,
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+
+    Ok(IndexProjectRequest {
+        repo_path: repo_path.ok_or_else(|| "--repo-path is required".to_string())?,
+        languages,
+        force_rebuild,
+        clean_stale,
     })
 }
 
