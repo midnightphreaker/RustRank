@@ -226,6 +226,107 @@ fn supported_source_files_ignores_persistent_rustrank_data() {
 }
 
 #[test]
+fn supported_source_files_honors_default_and_configured_excludes() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.path().join(".venv")).expect("venv dir");
+    std::fs::write(
+        fixture.path().join(".venv/probe.py"),
+        "def should_not_index_venv(): pass",
+    )
+    .expect("venv source");
+    std::fs::create_dir_all(fixture.path().join("generated")).expect("generated dir");
+    std::fs::write(
+        fixture.path().join("generated/probe.py"),
+        "def should_not_index_generated(): pass",
+    )
+    .expect("generated source");
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"excludes":{"paths":["generated/**"]}}"#,
+    )
+    .expect("config");
+
+    let files = supported_source_files(fixture.path()).expect("source files");
+    let paths = files
+        .iter()
+        .map(|(path, _)| path.strip_prefix(fixture.path()).unwrap().to_string_lossy())
+        .collect::<Vec<_>>();
+
+    assert!(!paths.iter().any(|path| path.contains(".venv")));
+    assert!(!paths.iter().any(|path| path.contains("generated")));
+    assert!(paths.iter().any(|path| path == "pkg/core.py"));
+}
+
+#[test]
+fn contextual_search_honors_configured_excludes_for_filtered_searches() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.path().join(".venv")).expect("venv dir");
+    std::fs::write(
+        fixture.path().join(".venv/probe.py"),
+        "def should_not_find_venv_probe(): pass",
+    )
+    .expect("venv source");
+    std::fs::create_dir_all(fixture.path().join("generated")).expect("generated dir");
+    std::fs::write(
+        fixture.path().join("generated/probe.py"),
+        "def should_not_find_generated_probe(): pass",
+    )
+    .expect("generated source");
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"excludes":{"paths":["generated/**"]}}"#,
+    )
+    .expect("config");
+
+    let rows = contextual_search(
+        fixture.path().to_str().unwrap(),
+        "should_not_find",
+        Some("py"),
+        false,
+        0,
+    )
+    .expect("search");
+
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn index_project_honors_configured_excludes() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.path().join(".venv")).expect("venv dir");
+    std::fs::write(
+        fixture.path().join(".venv/probe.py"),
+        "def should_not_index_venv(): pass",
+    )
+    .expect("venv source");
+    std::fs::create_dir_all(fixture.path().join("generated")).expect("generated dir");
+    std::fs::write(
+        fixture.path().join("generated/probe.py"),
+        "def should_not_index_generated(): pass",
+    )
+    .expect("generated source");
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"languages":{"enabled":["python"]},"excludes":{"paths":["generated/**"]}}"#,
+    )
+    .expect("config");
+
+    let response =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+    let manifest = std::fs::read_to_string(
+        fixture
+            .path()
+            .join(".rustrank/index/v1/project_manifest.json"),
+    )
+    .expect("manifest");
+
+    assert_eq!(response.indexed_files, 4);
+    assert!(!manifest.contains(".venv/probe.py"));
+    assert!(!manifest.contains("generated/probe.py"));
+    assert!(manifest.contains("pkg/core.py"));
+}
+
+#[test]
 fn contextual_search_finds_regex_matches_with_context() {
     let fixture = fixture();
     let rows = contextual_search(

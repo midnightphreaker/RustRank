@@ -22,7 +22,7 @@ Core modules:
 Language detection scans non-ignored files and counts extension matches. The
 same matcher feeds parsing, enabled-language filtering, and indexing.
 
-Enabled languages come from `.rustrank_config.json`:
+Enabled languages and source excludes come from `.rustrank_config.json`:
 
 ```json
 {
@@ -35,6 +35,9 @@ Enabled languages come from `.rustrank_config.json`:
 When no valid language is configured, RustRank auto-detects from source files.
 Existing tools call `supported_source_files`, so config filtering applies to
 parsing, CodeRank, trace, and analysis paths.
+
+The `excludes.paths` and `excludes.extensions` config keys extend RustRank's
+default source exclusions. Search paths use the same exclude logic as indexing.
 
 ## Persistent Index
 

@@ -1760,6 +1760,7 @@ dependencies = [
  "axum",
  "blake3",
  "git2",
+ "globset",
  "graphops",
  "grep",
  "indexmap",

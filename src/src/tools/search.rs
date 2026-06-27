@@ -4,9 +4,10 @@ use regex::Regex;
 use walkdir::WalkDir;
 
 use crate::{
-    context::Language,
+    context::{Language, supported_source_files},
     error::{AppError, Result},
     fmt::{ApiUsageRow, SearchRow},
+    project_config,
 };
 
 use super::code_rank;
@@ -112,20 +113,23 @@ pub fn api_usage(
 }
 
 pub(crate) fn source_files(root: &Path, file_type: Option<&str>) -> Result<Vec<PathBuf>> {
+    if file_type.is_none() {
+        return Ok(supported_source_files(root)?
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect());
+    }
+
     let mut files = Vec::new();
     let normalized_ext = file_type.map(|ext| ext.trim_start_matches('.'));
+    let excludes = project_config::configured_excludes(root)?;
     for entry in WalkDir::new(root) {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
         let path = entry.path();
-        if path.components().any(|part| {
-            matches!(
-                part.as_os_str().to_string_lossy().as_ref(),
-                ".git" | "target" | "node_modules" | "dist" | "build"
-            )
-        }) {
+        if excludes.is_excluded(root, path) {
             continue;
         }
         if let Some(ext) = normalized_ext
