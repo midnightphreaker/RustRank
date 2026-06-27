@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 from pathlib import Path
 from urllib import error, request
@@ -30,11 +32,46 @@ EXPECTED_TOOLS = [
     "execute_paths",
     "get_config",
     "set_config",
+    "context",
+    "impact",
+    "detect_changes",
+    "query",
 ]
 
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+class EmbeddingHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+            dims = int(payload.get("dimensions", 3))
+        except (ValueError, json.JSONDecodeError):
+            dims = 3
+
+        vector = [0.0] * max(dims, 1)
+        vector[0] = 1.0
+        response = json.dumps({"data": [{"embedding": vector}]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def start_embedding_server() -> tuple[http.server.ThreadingHTTPServer, str]:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), EmbeddingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return server, f"http://{host}:{port}/v1"
 
 
 def write_file(path: Path, content: str) -> None:
@@ -235,7 +272,7 @@ def maybe_commit_fixture(root: Path) -> None:
         pass
 
 
-def rpc(url: str, method: str, params: object | None, request_id: int) -> dict:
+def rpc_response(url: str, method: str, params: object | None, request_id: int) -> dict:
     payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
     if params is not None:
         payload["params"] = params
@@ -267,9 +304,13 @@ def rpc(url: str, method: str, params: object | None, request_id: int) -> dict:
         raise SmokeFailure(f"{method} returned non-JSON content type: {content_type}")
 
     try:
-        decoded = json.loads(response_body)
+        return json.loads(response_body)
     except json.JSONDecodeError as exc:
         raise SmokeFailure(f"{method} returned invalid JSON: {response_body}") from exc
+
+
+def rpc(url: str, method: str, params: object | None, request_id: int) -> dict:
+    decoded = rpc_response(url, method, params, request_id)
 
     if decoded.get("error"):
         raise SmokeFailure(f"{method} returned JSON-RPC error: {decoded['error']}")
@@ -277,6 +318,14 @@ def rpc(url: str, method: str, params: object | None, request_id: int) -> dict:
         raise SmokeFailure(f"{method} returned no result: {decoded}")
 
     return decoded["result"]
+
+
+def rpc_error(url: str, method: str, params: object | None, request_id: int) -> dict:
+    decoded = rpc_response(url, method, params, request_id)
+    error_result = decoded.get("error")
+    if not isinstance(error_result, dict):
+        raise SmokeFailure(f"{method} returned no JSON-RPC error: {decoded}")
+    return error_result
 
 
 def call_tool(url: str, request_id: int, name: str, arguments: dict) -> None:
@@ -420,7 +469,120 @@ def tool_calls(repo_path: str) -> list[tuple[str, dict]]:
             "set_config",
             {"repo_path": repo_path, "key": "smoke_test", "value": {"ok": True}},
         ),
+        ("context", {"repo_path": repo_path, "symbol": "authenticate"}),
+        (
+            "impact",
+            {"repo_path": repo_path, "target": "authenticate", "max_depth": 2},
+        ),
+        ("detect_changes", {"repo_path": repo_path}),
+        ("query", {"repo_path": repo_path, "query": "login authenticate", "limit": 5}),
     ]
+
+
+def exercise_resources(url: str, request_id: int) -> int:
+    resources_result = rpc(url, "resources/list", {}, request_id)
+    request_id += 1
+    resources = resources_result.get("resources", [])
+    resource_uris = {resource.get("uri") for resource in resources}
+    expected_resources = {
+        "rustrank://repo/current/context",
+        "rustrank://repo/current/schema",
+        "rustrank://repo/current/modules",
+        "rustrank://repo/current/processes",
+    }
+    missing_resources = sorted(expected_resources - resource_uris)
+    if missing_resources:
+        raise SmokeFailure(f"resource list missing: {missing_resources}")
+
+    templates_result = rpc(url, "resources/templates/list", {}, request_id)
+    request_id += 1
+    templates = templates_result.get("resourceTemplates", [])
+    template_uris = {template.get("uriTemplate") for template in templates}
+    expected_templates = {
+        "rustrank://repo/current/module/{name}",
+        "rustrank://repo/current/process/{name}",
+    }
+    missing_templates = sorted(expected_templates - template_uris)
+    if missing_templates:
+        raise SmokeFailure(f"resource template list missing: {missing_templates}")
+
+    resource_reads = [
+        ("rustrank://repo/current/context", "RustRank repository context"),
+        ("rustrank://repo/current/schema", "RustRank graph schema"),
+        ("rustrank://repo/current/modules", "RustRank modules"),
+        ("rustrank://repo/current/processes", "RustRank processes"),
+    ]
+
+    module_name = None
+    process_name = None
+    for uri, expected_text in resource_reads:
+        read_result = rpc(url, "resources/read", {"uri": uri}, request_id)
+        request_id += 1
+        contents = read_result.get("contents", [])
+        text = "\n".join(item.get("text", "") for item in contents)
+        if expected_text not in text:
+            raise SmokeFailure(f"resource {uri} did not contain {expected_text!r}: {read_result}")
+        if uri.endswith("/modules"):
+            module_name = first_backtick_value(text)
+            if not contains_fixture_path(text):
+                raise SmokeFailure(
+                    f"modules resource did not describe the indexed fixture repo: {read_result}"
+                )
+        if uri.endswith("/processes"):
+            process_name = first_backtick_value(text)
+
+    if module_name:
+        uri = f"rustrank://repo/current/module/{module_name}"
+        read_result = rpc(url, "resources/read", {"uri": uri}, request_id)
+        request_id += 1
+        text = "\n".join(item.get("text", "") for item in read_result.get("contents", []))
+        if f"Module `{module_name}`" not in text:
+            raise SmokeFailure(f"module resource {uri} returned unexpected content: {read_result}")
+        if not contains_fixture_path(text):
+            raise SmokeFailure(f"module resource {uri} did not come from fixture repo: {read_result}")
+
+    if process_name:
+        uri = f"rustrank://repo/current/process/{process_name}"
+        read_result = rpc(url, "resources/read", {"uri": uri}, request_id)
+        request_id += 1
+        text = "\n".join(item.get("text", "") for item in read_result.get("contents", []))
+        if f"Process `{process_name}`" not in text:
+            raise SmokeFailure(f"process resource {uri} returned unexpected content: {read_result}")
+
+    error_result = rpc_error(
+        url,
+        "resources/read",
+        {"uri": "rustrank://repo/current/unknown"},
+        request_id,
+    )
+    request_id += 1
+    if "unknown RustRank resource URI" not in json.dumps(error_result):
+        raise SmokeFailure(f"unknown resource returned unexpected error: {error_result}")
+
+    return request_id
+
+
+def first_backtick_value(text: str) -> str | None:
+    for line in text.splitlines():
+        if "`" not in line:
+            continue
+        parts = line.split("`")
+        if len(parts) >= 3 and parts[1].strip():
+            return parts[1].strip()
+    return None
+
+
+def contains_fixture_path(text: str) -> bool:
+    return any(
+        path in text
+        for path in [
+            "pkg/core.py",
+            "pkg/models.py",
+            "src/lib.rs",
+            "app/AuthService.cs",
+            "web/auth.ts",
+        ]
+    )
 
 
 def run_smoke(url: str, repo_path: str, fixture_dir: Path | None = None) -> None:
@@ -477,6 +639,33 @@ def run_smoke(url: str, repo_path: str, fixture_dir: Path | None = None) -> None
         ):
             raise SmokeFailure("index_project AGENTS.md section is missing or malformed")
 
+    embedding_server, embedding_base_url = start_embedding_server()
+    try:
+        embedding_result = call_tool_json(
+            url,
+            request_id,
+            "index_project",
+            {
+                "repo_path": repo_path,
+                "languages": None,
+                "force_rebuild": False,
+                "clean_stale": True,
+                "embeddings": True,
+                "embedding_base_url": embedding_base_url,
+                "embedding_model": "smoke-embedding-model",
+                "embedding_dims": 3,
+                "embedding_api_key": "smoke-secret-api-key",
+            },
+        )
+    finally:
+        embedding_server.shutdown()
+        embedding_server.server_close()
+    request_id += 1
+    if "smoke-secret-api-key" in json.dumps(embedding_result):
+        raise SmokeFailure("index_project embedding API key leaked into tool response")
+
+    request_id = exercise_resources(url, request_id)
+
     for name, arguments in tool_calls(repo_path):
         call_tool(url, request_id, name, arguments)
         request_id += 1
@@ -484,6 +673,7 @@ def run_smoke(url: str, repo_path: str, fixture_dir: Path | None = None) -> None
     print(f"initialized no-SSE Streamable HTTP endpoint: {url}")
     print(f"listed {len(names)} tools")
     print(f"called {len(EXPECTED_TOOLS)} tools successfully")
+    print("exercised resources/list, resources/templates/list, and resources/read")
 
 
 def parse_args() -> argparse.Namespace:

@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod analysis;
 pub mod code_rank;
 pub mod config;
@@ -5,14 +6,21 @@ pub mod index;
 pub mod search;
 pub mod trace;
 
-use std::net::SocketAddr;
+use std::{future::Future, net::SocketAddr};
 
+use crate::embeddings::EmbeddingOptions;
 use axum::routing::get;
 use rmcp::{
-    ServerHandler, ServiceExt,
+    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    model::{
+        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+        ServerInfo,
+    },
+    schemars,
+    service::{RequestContext, RoleServer},
+    tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
@@ -40,6 +48,10 @@ pub const ALL_TOOLS: &[&str] = &[
     "execute_paths",
     "get_config",
     "set_config",
+    "context",
+    "impact",
+    "detect_changes",
+    "query",
 ];
 
 #[derive(Debug, Clone)]
@@ -156,12 +168,63 @@ struct SetConfigRequest {
     value: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, schemars::JsonSchema)]
 struct IndexProjectRequest {
     repo_path: String,
     languages: Option<Vec<String>>,
     force_rebuild: bool,
     clean_stale: bool,
+    #[serde(default)]
+    embeddings: Option<bool>,
+    #[serde(default)]
+    embedding_base_url: Option<String>,
+    #[serde(default)]
+    embedding_model: Option<String>,
+    #[serde(default)]
+    embedding_dims: Option<usize>,
+    #[serde(default)]
+    embedding_api_key: Option<String>,
+}
+
+impl std::fmt::Debug for IndexProjectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexProjectRequest")
+            .field("repo_path", &self.repo_path)
+            .field("languages", &self.languages)
+            .field("force_rebuild", &self.force_rebuild)
+            .field("clean_stale", &self.clean_stale)
+            .field("embeddings", &self.embeddings)
+            .field("embedding_base_url", &self.embedding_base_url)
+            .field("embedding_model", &self.embedding_model)
+            .field("embedding_dims", &self.embedding_dims)
+            .field(
+                "embedding_api_key",
+                &self.embedding_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ContextRequest {
+    repo_path: String,
+    symbol: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ImpactRequest {
+    repo_path: String,
+    target: String,
+    #[serde(default = "default_impact_depth")]
+    max_depth: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct QueryRequest {
+    repo_path: String,
+    query: String,
+    #[serde(default = "default_query_limit")]
+    limit: usize,
 }
 
 #[tool_router]
@@ -170,12 +233,26 @@ impl RustRankRouter {
         description = "Index a repository into persistent per-language caches and a project manifest"
     )]
     fn index_project(&self, Parameters(req): Parameters<IndexProjectRequest>) -> String {
-        json(index::index_project(
+        let repo_path = req.repo_path.clone();
+        let result = crate::index::index_project_with_embeddings(
             &req.repo_path,
             req.languages,
             req.force_rebuild,
             req.clean_stale,
-        ))
+            EmbeddingOptions {
+                enabled: req.embeddings,
+                base_url: req.embedding_base_url,
+                model: req.embedding_model,
+                dimensions: req.embedding_dims,
+                api_key: req.embedding_api_key,
+            },
+        );
+        if result.is_ok()
+            && let Err(err) = agent::set_current_repo(repo_path)
+        {
+            return json::<()>(Err(err));
+        }
+        json(result)
     }
 
     #[tool(description = "Search repository files for a pattern with line context")]
@@ -306,13 +383,82 @@ impl RustRankRouter {
     fn set_config(&self, Parameters(req): Parameters<SetConfigRequest>) -> String {
         json(config::set_config(&req.repo_path, &req.key, req.value))
     }
+
+    #[tool(
+        description = "Return callers, callees, imports, defining file, and resources for one symbol"
+    )]
+    fn context(&self, Parameters(req): Parameters<ContextRequest>) -> String {
+        json(agent::symbol_context(&req.repo_path, &req.symbol))
+    }
+
+    #[tool(description = "Estimate upstream and downstream blast radius for a symbol or module")]
+    fn impact(&self, Parameters(req): Parameters<ImpactRequest>) -> String {
+        json(agent::impact(&req.repo_path, &req.target, req.max_depth))
+    }
+
+    #[tool(description = "Map git diff hunks to changed symbols and affected callers/importers")]
+    fn detect_changes(&self, Parameters(req): Parameters<ConfigPathRequest>) -> String {
+        json(agent::detect_changes(&req.repo_path))
+    }
+
+    #[tool(
+        description = "Agent-oriented graph search combining lexical matches and module centrality"
+    )]
+    fn query(&self, Parameters(req): Parameters<QueryRequest>) -> String {
+        json(agent::query(&req.repo_path, &req.query, req.limit))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RustRankRouter {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("RustRank repository analysis tools")
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_instructions("RustRank repository analysis tools")
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = std::result::Result<ListResourcesResult, McpError>> + Send + '_ {
+        std::future::ready(
+            agent::resources()
+                .map(ListResourcesResult::with_all_items)
+                .map_err(mcp_internal_error),
+        )
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = std::result::Result<ListResourceTemplatesResult, McpError>> + Send + '_
+    {
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
+            agent::resource_templates(),
+        )))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = std::result::Result<ReadResourceResult, McpError>> + Send + '_ {
+        let uri = request.uri;
+        std::future::ready(
+            agent::read_current_resource(&uri)
+                .map(|text| {
+                    ReadResourceResult::new(vec![
+                        ResourceContents::text(text, uri).with_mime_type("text/markdown"),
+                    ])
+                })
+                .map_err(mcp_resource_error),
+        )
     }
 }
 
@@ -338,12 +484,21 @@ pub fn serve() -> anyhow::Result<()> {
 fn run_index_project_cli() -> anyhow::Result<()> {
     match parse_index_project_cli(std::env::args().skip(2).collect()) {
         Ok(req) => {
-            let response = index::index_project(
+            let repo_path = req.repo_path.clone();
+            let response = crate::index::index_project_with_embeddings(
                 &req.repo_path,
                 req.languages,
                 req.force_rebuild,
                 req.clean_stale,
+                EmbeddingOptions {
+                    enabled: req.embeddings,
+                    base_url: req.embedding_base_url,
+                    model: req.embedding_model,
+                    dimensions: req.embedding_dims,
+                    api_key: req.embedding_api_key,
+                },
             )?;
+            agent::set_current_repo(repo_path)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }
@@ -354,7 +509,7 @@ fn run_index_project_cli() -> anyhow::Result<()> {
                     "error": true,
                     "code": "INVALID_ARGUMENTS",
                     "message": message,
-                    "suggestion": "usage: rustrank index-project --repo-path <path> [--languages python,rust] [--force-rebuild] [--clean-stale]"
+                    "suggestion": "usage: rustrank index-project --repo-path <path> [--languages python,rust] [--force-rebuild] [--clean-stale] [--embeddings] [--embedding-base-url <url>] [--embedding-model <model>] [--embedding-dims <n>] [--embedding-api-key <key>]"
                 })
             );
             std::process::exit(2);
@@ -367,6 +522,11 @@ fn parse_index_project_cli(args: Vec<String>) -> std::result::Result<IndexProjec
     let mut languages = None;
     let mut force_rebuild = false;
     let mut clean_stale = false;
+    let mut embeddings = None;
+    let mut embedding_base_url = None;
+    let mut embedding_model = None;
+    let mut embedding_dims = None;
+    let mut embedding_api_key = None;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -391,6 +551,33 @@ fn parse_index_project_cli(args: Vec<String>) -> std::result::Result<IndexProjec
             }
             "--force-rebuild" => force_rebuild = true,
             "--clean-stale" => clean_stale = true,
+            "--embeddings" => embeddings = Some(true),
+            "--embedding-base-url" => {
+                embedding_base_url = Some(
+                    iter.next()
+                        .ok_or_else(|| "--embedding-base-url requires a value".to_string())?,
+                );
+            }
+            "--embedding-model" => {
+                embedding_model = Some(
+                    iter.next()
+                        .ok_or_else(|| "--embedding-model requires a value".to_string())?,
+                );
+            }
+            "--embedding-dims" => {
+                embedding_dims = Some(
+                    iter.next()
+                        .ok_or_else(|| "--embedding-dims requires a value".to_string())?
+                        .parse()
+                        .map_err(|err| format!("invalid --embedding-dims: {err}"))?,
+                );
+            }
+            "--embedding-api-key" => {
+                embedding_api_key = Some(
+                    iter.next()
+                        .ok_or_else(|| "--embedding-api-key requires a value".to_string())?,
+                );
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -400,7 +587,28 @@ fn parse_index_project_cli(args: Vec<String>) -> std::result::Result<IndexProjec
         languages,
         force_rebuild,
         clean_stale,
+        embeddings,
+        embedding_base_url,
+        embedding_model,
+        embedding_dims,
+        embedding_api_key,
     })
+}
+
+fn default_impact_depth() -> usize {
+    2
+}
+
+fn default_query_limit() -> usize {
+    10
+}
+
+fn mcp_internal_error(err: crate::AppError) -> McpError {
+    McpError::internal_error(err.to_string(), None)
+}
+
+fn mcp_resource_error(err: crate::AppError) -> McpError {
+    McpError::resource_not_found(err.to_string(), None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

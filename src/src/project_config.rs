@@ -29,7 +29,7 @@ pub fn set_raw_config_value(repo_path: &Path, key: &str, value: Value) -> Result
         Value::Object(map) => map,
         _ => Map::new(),
     };
-    config.insert(key.to_string(), value);
+    set_nested_value(&mut config, key, value);
     let updated = Value::Object(config);
     std::fs::write(path, serde_json::to_string_pretty(&updated)?)?;
     Ok(updated)
@@ -93,4 +93,28 @@ fn auto_detected_languages(repo_path: &Path) -> Result<ConfiguredLanguages> {
         invalid: Vec::new(),
         auto_detected: true,
     })
+}
+
+fn set_nested_value(config: &mut Map<String, Value>, key: &str, value: Value) {
+    let parts = key
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() <= 1 {
+        config.insert(key.to_string(), value);
+        return;
+    }
+
+    let mut current = config;
+    for part in &parts[..parts.len() - 1] {
+        let entry = current
+            .entry((*part).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        current = entry.as_object_mut().expect("object inserted above");
+    }
+    current.insert(parts[parts.len() - 1].to_string(), value);
 }

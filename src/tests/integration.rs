@@ -1,5 +1,11 @@
 use rustrank::context::{Context, DefKind, Language, supported_source_files};
+use rustrank::embeddings::EmbeddingOptions;
+use rustrank::index::index_project_with_embeddings;
 use rustrank::tools::ALL_TOOLS;
+use rustrank::tools::agent::{
+    detect_changes, impact, query, read_current_resource, resource_templates, resources,
+    symbol_context,
+};
 use rustrank::tools::analysis::{error_patterns, exec_paths, perf_bottleneck};
 use rustrank::tools::code_rank::{code_hotspots, coderank_analysis};
 use rustrank::tools::config::{get_config, set_config};
@@ -12,11 +18,15 @@ mod fixtures;
 use fixtures::fixture;
 
 #[test]
-fn router_registers_fifteen_tools() {
-    assert_eq!(ALL_TOOLS.len(), 15);
+fn router_registers_agent_facing_tools() {
+    assert_eq!(ALL_TOOLS.len(), 19);
     assert!(ALL_TOOLS.contains(&"exec_paths"));
     assert!(ALL_TOOLS.contains(&"execute_paths"));
     assert!(ALL_TOOLS.contains(&"index_project"));
+    assert!(ALL_TOOLS.contains(&"context"));
+    assert!(ALL_TOOLS.contains(&"impact"));
+    assert!(ALL_TOOLS.contains(&"detect_changes"));
+    assert!(ALL_TOOLS.contains(&"query"));
 }
 
 #[test]
@@ -401,6 +411,41 @@ fn index_project_generates_language_shards_and_project_manifest() {
             .expect("manifest json");
     assert_eq!(manifest["header"]["schema_version"], 1);
     assert!(manifest["languages"].as_array().unwrap().len() >= 5);
+    assert_eq!(
+        manifest["nodes"].as_array().unwrap()[0]["schema"],
+        "graph_node"
+    );
+    assert!(
+        manifest["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "symbol" && node["name"] == "authenticate")
+    );
+    assert!(
+        manifest["graph_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["kind"] == "DEFINES")
+    );
+    assert!(
+        manifest["graph_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["kind"] == "CALLS")
+    );
+    assert!(
+        manifest["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|process| process["name"] == "authenticate"
+                && process["call_chain"]
+                    .as_array()
+                    .is_some_and(|chain| chain.iter().any(|step| step["symbol"] == "login")))
+    );
     assert!(
         manifest["edges"]
             .as_array()
@@ -410,6 +455,8 @@ fn index_project_generates_language_shards_and_project_manifest() {
                 |edge| edge["source_module"] == "pkg.core" && edge["target_module"] == "pkg.models"
             )
     );
+    assert!(manifest["freshness"]["indexed_head"].is_string());
+    assert!(manifest["freshness"]["current_head"].is_string());
 
     let cache_text = std::fs::read_to_string(
         fixture
@@ -438,6 +485,128 @@ fn index_project_creates_agents_md_with_index_summary() {
     assert!(agents.contains("| csharp |"));
     assert!(agents.contains("| typescript |"));
     assert!(agents.contains("| javascript |"));
+    assert!(agents.contains("Agent-facing tools"));
+    assert!(agents.contains("rustrank://repo/current/context"));
+    assert!(agents.contains("rustrank://repo/current/processes"));
+    assert!(
+        fixture
+            .path()
+            .join(".rustrank/skills/exploring.md")
+            .exists()
+    );
+}
+
+#[test]
+fn resource_helpers_expose_current_repo_context() {
+    let fixture = fixture();
+    index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+    let old_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(fixture.path()).expect("set cwd");
+
+    let listed = resources().expect("resources");
+    let templates = resource_templates();
+    let context = read_current_resource("rustrank://repo/current/context").expect("context");
+    let modules = read_current_resource("rustrank://repo/current/modules").expect("modules");
+    let processes = read_current_resource("rustrank://repo/current/processes").expect("processes");
+    let module = read_current_resource("rustrank://repo/current/module/pkg.core").expect("module");
+    let process =
+        read_current_resource("rustrank://repo/current/process/authenticate").expect("process");
+    let unknown = read_current_resource("rustrank://repo/current/module/missing");
+    let unknown_process = read_current_resource("rustrank://repo/current/process/missing");
+    let unknown_uri = read_current_resource("rustrank://repo/current/unknown");
+
+    std::env::set_current_dir(old_cwd).expect("restore cwd");
+
+    assert!(
+        listed
+            .iter()
+            .any(|resource| resource.uri == "rustrank://repo/current/context")
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|resource| resource.uri == "rustrank://repo/current/processes")
+    );
+    assert!(
+        templates
+            .iter()
+            .any(|template| template.uri_template == "rustrank://repo/current/module/{name}")
+    );
+    assert!(
+        templates
+            .iter()
+            .any(|template| template.uri_template == "rustrank://repo/current/process/{name}")
+    );
+    assert!(context.contains("RustRank repository context"));
+    assert!(modules.contains("RustRank modules"));
+    assert!(processes.contains("RustRank processes"));
+    assert!(processes.contains("authenticate"));
+    assert!(module.contains("authenticate"));
+    assert!(process.contains("Process `authenticate`"));
+    assert!(process.contains("Call chain"));
+    assert!(process.contains("login"));
+    assert!(unknown.is_err());
+    assert!(
+        unknown_process
+            .expect_err("unknown process")
+            .to_string()
+            .contains("process not found: missing")
+    );
+    assert!(unknown_uri.is_err());
+}
+
+#[test]
+fn context_impact_change_and_query_tools_return_agent_graph_context() {
+    let fixture = fixture();
+    index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(fixture.path())
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(fixture.path())
+        .output()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "fixture"])
+        .env("GIT_AUTHOR_NAME", "RustRank Test")
+        .env("GIT_AUTHOR_EMAIL", "rustrank@example.test")
+        .env("GIT_COMMITTER_NAME", "RustRank Test")
+        .env("GIT_COMMITTER_EMAIL", "rustrank@example.test")
+        .current_dir(fixture.path())
+        .output()
+        .expect("git commit");
+    std::fs::write(
+        fixture.path().join("pkg/core.py"),
+        r#"
+import time
+from pkg.models import User
+
+def authenticate(user_id, email):
+    return User(user_id, email)
+"#,
+    )
+    .expect("modify core");
+
+    let context =
+        symbol_context(fixture.path().to_str().unwrap(), "authenticate").expect("context");
+    let impact = impact(fixture.path().to_str().unwrap(), "authenticate", 3).expect("impact");
+    let changes = detect_changes(fixture.path().to_str().unwrap()).expect("changes");
+    let results = query(fixture.path().to_str().unwrap(), "login authenticate", 5).expect("query");
+
+    assert_eq!(context.symbol, "authenticate");
+    assert!(context.defining_file.ends_with("pkg/core.py"));
+    assert!(impact.edges.iter().any(|edge| edge.confidence == "high"));
+    assert!(
+        changes
+            .changed_symbols
+            .iter()
+            .any(|symbol| symbol.name == "authenticate")
+    );
+    assert!(results.iter().any(|row| row.file.ends_with("pkg/core.py")));
+    assert!(results.iter().any(|row| row.process.as_deref().is_some()));
 }
 
 #[test]
@@ -522,6 +691,114 @@ fn index_project_rebuilds_corrupt_cache_file() {
 }
 
 #[test]
+fn index_project_rebuilds_non_utf8_cache_file() {
+    let fixture = fixture();
+    let first =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("first index");
+
+    let python_file = first
+        .languages
+        .iter()
+        .find(|summary| summary.language == Language::Python)
+        .expect("python summary");
+    let index_path = fixture.path().join(&python_file.index_file);
+    let shard: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(index_path).expect("language index"))
+            .expect("language shard json");
+    let cache_file = shard["files"][0]["cache_file"]
+        .as_str()
+        .expect("cache file path");
+    std::fs::write(fixture.path().join(cache_file), [0xff, 0xfe, 0x00]).expect("corrupt cache");
+
+    let rebuilt =
+        index_project(fixture.path().to_str().unwrap(), None, false, true).expect("rebuild index");
+
+    assert_eq!(rebuilt.scanned_files, first.scanned_files);
+    assert_eq!(rebuilt.cache_misses, 1);
+    assert!(
+        rebuilt
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ignored unreadable cache file")),
+        "{:?}",
+        rebuilt.warnings
+    );
+}
+
+#[test]
+fn index_project_skips_non_utf8_source_with_warning() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.path().join("pkg/binary.py"),
+        [0xff, 0xfe, 0x00, 0x61],
+    )
+    .expect("binary source");
+
+    let summary =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+
+    assert_eq!(summary.indexed_files + 1, summary.scanned_files);
+    assert!(
+        summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("skipped non-UTF-8 source file `pkg/binary.py`")),
+        "{:?}",
+        summary.warnings
+    );
+    let manifest_text = std::fs::read_to_string(
+        fixture
+            .path()
+            .join(".rustrank/index/v1/project_manifest.json"),
+    )
+    .expect("manifest");
+    assert!(!manifest_text.contains("pkg/binary.py"));
+}
+
+#[test]
+fn index_project_warns_and_skips_non_utf8_agents_md_update() {
+    let fixture = fixture();
+    std::fs::write(fixture.path().join("AGENTS.md"), [0xff, 0xfe, 0x00]).expect("agents file");
+
+    let summary =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+
+    assert!(
+        summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("skipped AGENTS.md update")),
+        "{:?}",
+        summary.warnings
+    );
+    assert_eq!(
+        std::fs::read(fixture.path().join("AGENTS.md")).expect("agents bytes"),
+        vec![0xff, 0xfe, 0x00]
+    );
+}
+
+#[test]
+fn index_project_accepts_partial_tree_sitter_parse() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.path().join("web/partial.ts"),
+        "export function halfWritten(\n",
+    )
+    .expect("partial source");
+
+    let summary =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+
+    assert_eq!(summary.scanned_files, summary.indexed_files);
+    assert!(
+        summary
+            .languages
+            .iter()
+            .any(|language| language.language == Language::TypeScript && language.files >= 2)
+    );
+}
+
+#[test]
 fn cli_index_project_generates_manifest_json() {
     let fixture = fixture();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_rustrank"))
@@ -555,6 +832,250 @@ fn cli_index_project_generates_manifest_json() {
             .path()
             .join(".rustrank/index/v1/project_manifest.json")
             .exists()
+    );
+}
+
+#[test]
+fn cli_index_project_accepts_embedding_flags_without_exposing_api_key() {
+    let fixture = fixture();
+    let fake_key = "rrk-test-secret-do-not-log";
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rustrank"))
+        .args([
+            "index-project",
+            "--repo-path",
+            fixture.path().to_str().unwrap(),
+            "--force-rebuild",
+            "--clean-stale",
+            "--embeddings",
+            "--embedding-base-url",
+            "http://127.0.0.1:9/v1",
+            "--embedding-model",
+            "text-embedding-test",
+            "--embedding-dims",
+            "3",
+            "--embedding-api-key",
+            fake_key,
+        ])
+        .output()
+        .expect("run index cli");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cli json response");
+    assert!(summary["indexed_files"].as_u64().unwrap() > 0);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains(fake_key));
+    assert!(!stderr.contains(fake_key));
+}
+
+#[test]
+fn embedding_options_debug_redacts_api_key() {
+    let options = embedding_options("http://127.0.0.1:9/v1", Some("secret-test-key"));
+
+    let rendered = format!("{options:?}");
+
+    assert!(!rendered.contains("secret-test-key"));
+    assert!(rendered.contains("<redacted>"));
+}
+
+#[test]
+fn embedding_index_reuses_cached_vectors() {
+    let fixture = fixture();
+    let server = MockEmbeddingServer::start(MockEmbeddingBehavior::Fixed(vec![0.1, 0.2, 0.3]));
+    let options = embedding_options(&server.base_url, None);
+
+    let first = index_project_with_embeddings(
+        fixture.path().to_str().unwrap(),
+        Some(vec!["python".to_string()]),
+        true,
+        true,
+        options.clone(),
+    )
+    .expect("first embedding index");
+    let after_first = server.request_count();
+    let second = index_project_with_embeddings(
+        fixture.path().to_str().unwrap(),
+        Some(vec!["python".to_string()]),
+        false,
+        true,
+        options,
+    )
+    .expect("second embedding index");
+
+    assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+    assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+    assert!(after_first > 0);
+    assert_eq!(server.request_count(), after_first);
+    assert!(
+        fixture
+            .path()
+            .join(".rustrank/index/v1/embeddings")
+            .exists()
+    );
+}
+
+#[test]
+fn embedding_index_rebuilds_non_utf8_cache_file() {
+    let fixture = fixture();
+    let server = MockEmbeddingServer::start(MockEmbeddingBehavior::Fixed(vec![0.1, 0.2, 0.3]));
+    let options = embedding_options(&server.base_url, None);
+    index_project_with_embeddings(
+        fixture.path().to_str().unwrap(),
+        Some(vec!["python".to_string()]),
+        true,
+        true,
+        options.clone(),
+    )
+    .expect("first embedding index");
+    let after_first = server.request_count();
+    let cache_dir = fixture.path().join(".rustrank/index/v1/embeddings");
+    let cache_file = std::fs::read_dir(&cache_dir)
+        .expect("embedding cache dir")
+        .find_map(|entry| {
+            let path = entry.expect("entry").path();
+            (path.extension().is_some_and(|ext| ext == "json")).then_some(path)
+        })
+        .expect("embedding cache file");
+    std::fs::write(&cache_file, [0xff, 0xfe, 0x00]).expect("corrupt embedding cache");
+
+    let rebuilt = index_project_with_embeddings(
+        fixture.path().to_str().unwrap(),
+        Some(vec!["python".to_string()]),
+        false,
+        true,
+        options,
+    )
+    .expect("rebuild embedding index");
+
+    assert!(server.request_count() > after_first);
+    assert!(
+        rebuilt
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("embedding cache read failed")),
+        "{:?}",
+        rebuilt.warnings
+    );
+}
+
+#[test]
+fn embedding_index_warns_on_dimension_mismatch() {
+    let fixture = fixture();
+    let server = MockEmbeddingServer::start(MockEmbeddingBehavior::Fixed(vec![0.1, 0.2]));
+
+    let response = index_project_with_embeddings(
+        fixture.path().to_str().unwrap(),
+        Some(vec!["python".to_string()]),
+        true,
+        true,
+        embedding_options(&server.base_url, None),
+    )
+    .expect("embedding index");
+
+    assert!(
+        response
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("embedding dimension mismatch")),
+        "{:?}",
+        response.warnings
+    );
+}
+
+#[test]
+fn embedding_index_omits_authorization_without_api_key() {
+    let fixture = fixture();
+    let server = MockEmbeddingServer::start(MockEmbeddingBehavior::Fixed(vec![0.1, 0.2, 0.3]));
+
+    index_project_with_embeddings(
+        fixture.path().to_str().unwrap(),
+        Some(vec!["python".to_string()]),
+        true,
+        true,
+        embedding_options(&server.base_url, None),
+    )
+    .expect("embedding index");
+
+    assert!(server.request_count() > 0);
+    assert!(
+        server.authorization_headers().iter().all(Option::is_none),
+        "{:?}",
+        server.authorization_headers()
+    );
+}
+
+#[test]
+fn query_uses_cached_embeddings_for_semantic_ranking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("pkg")).expect("pkg dir");
+    std::fs::write(
+        dir.path().join("pkg/billing.py"),
+        "def billing_invoice():\n    return 'invoice ledger'\n",
+    )
+    .expect("billing");
+    std::fs::write(
+        dir.path().join("pkg/auth.py"),
+        "def auth_token():\n    return 'session token'\n",
+    )
+    .expect("auth");
+    let server = MockEmbeddingServer::start(MockEmbeddingBehavior::ByInput);
+    set_config(
+        dir.path().to_str().unwrap(),
+        "embeddings.enabled",
+        serde_json::json!(true),
+    )
+    .expect("enable embeddings");
+    set_config(
+        dir.path().to_str().unwrap(),
+        "embeddings.base_url",
+        serde_json::json!(server.base_url),
+    )
+    .expect("base url");
+    set_config(
+        dir.path().to_str().unwrap(),
+        "embeddings.model",
+        serde_json::json!("text-embedding-test"),
+    )
+    .expect("model");
+    set_config(
+        dir.path().to_str().unwrap(),
+        "embeddings.dimensions",
+        serde_json::json!(3),
+    )
+    .expect("dimensions");
+    index_project_with_embeddings(
+        dir.path().to_str().unwrap(),
+        Some(vec!["python".to_string()]),
+        true,
+        true,
+        EmbeddingOptions {
+            enabled: Some(true),
+            base_url: None,
+            model: None,
+            dimensions: None,
+            api_key: None,
+        },
+    )
+    .expect("index embeddings");
+
+    let rows = query(dir.path().to_str().unwrap(), "payments", 5).expect("semantic query");
+
+    assert!(
+        rows.first()
+            .is_some_and(|row| row.file.ends_with("pkg/billing.py")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.first()
+            .is_some_and(|row| row.match_reasons.iter().any(|reason| reason == "semantic")),
+        "{rows:?}"
     );
 }
 
@@ -711,6 +1232,157 @@ fn config_round_trips_json_values() {
 
     let got = get_config(fixture.path().to_str().unwrap()).expect("get updated");
     assert_eq!(got["threshold"], 3);
+
+    let updated = set_config(
+        fixture.path().to_str().unwrap(),
+        "embeddings.enabled",
+        serde_json::json!(true),
+    )
+    .expect("set nested");
+    assert_eq!(updated["embeddings"]["enabled"], true);
+
+    let updated = set_config(
+        fixture.path().to_str().unwrap(),
+        "embeddings.model",
+        serde_json::json!("text-image-embedding"),
+    )
+    .expect("set nested model");
+    assert_eq!(updated["embeddings"]["model"], "text-image-embedding");
+}
+
+#[derive(Clone)]
+struct MockEmbeddingServer {
+    base_url: String,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    authorization_headers: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+enum MockEmbeddingBehavior {
+    Fixed(Vec<f32>),
+    ByInput,
+}
+
+impl MockEmbeddingServer {
+    fn start(behavior: MockEmbeddingBehavior) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let authorization_headers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread_requests = requests.clone();
+        let thread_authorization_headers = authorization_headers.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let request = read_http_request(&mut stream);
+                thread_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                thread_authorization_headers
+                    .lock()
+                    .expect("auth headers")
+                    .push(authorization_header(&request));
+                let vector = match &behavior {
+                    MockEmbeddingBehavior::Fixed(vector) => vector.clone(),
+                    MockEmbeddingBehavior::ByInput => vector_for_request(&request),
+                };
+                let body = serde_json::json!({
+                    "data": [{ "embedding": vector }]
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                use std::io::Write;
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+
+        Self {
+            base_url,
+            requests,
+            authorization_headers,
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn authorization_headers(&self) -> Vec<Option<String>> {
+        self.authorization_headers
+            .lock()
+            .expect("auth headers")
+            .clone()
+    }
+}
+
+fn embedding_options(base_url: &str, api_key: Option<&str>) -> EmbeddingOptions {
+    EmbeddingOptions {
+        enabled: Some(true),
+        base_url: Some(base_url.to_string()),
+        model: Some("text-embedding-test".to_string()),
+        dimensions: Some(3),
+        api_key: api_key.map(ToOwned::to_owned),
+    }
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 1024];
+    loop {
+        let read = stream.read(&mut chunk).expect("read request");
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        let request = String::from_utf8_lossy(&buffer);
+        if let Some(header_end) = request.find("\r\n\r\n") {
+            let headers = &request[..header_end];
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if buffer.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+fn authorization_header(request: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        line.strip_prefix("authorization: ")
+            .or_else(|| line.strip_prefix("Authorization: "))
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn vector_for_request(request: &str) -> Vec<f32> {
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let input = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("input")
+                .and_then(|input| input.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if input.contains("billing_invoice") || input.contains("payments") {
+        vec![1.0, 0.0, 0.0]
+    } else if input.contains("auth_token") {
+        vec![0.0, 1.0, 0.0]
+    } else {
+        vec![0.0, 0.0, 1.0]
+    }
 }
 
 fn commit_fixture(root: &std::path::Path) {

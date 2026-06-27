@@ -10,7 +10,9 @@ use crate::{
         Context, Definition, Import, Language, LocalModuleResolver, ModuleDef,
         all_supported_source_files, module_name_from_path, rel_string,
     },
+    embeddings::{self, EmbeddingOptions, EmbeddingSource},
     error::{AppError, Result},
+    process::{ProcessFlow, call_edges, derive_processes},
     project_config,
 };
 
@@ -97,6 +99,10 @@ struct ProjectManifest {
     modules: Vec<ProjectModule>,
     edges: Vec<ProjectImportEdge>,
     unresolved_imports: Vec<ProjectImportEdge>,
+    nodes: Vec<GraphNode>,
+    graph_edges: Vec<GraphEdge>,
+    processes: Vec<ProcessFlow>,
+    freshness: Freshness,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,11 +135,56 @@ struct ProjectImportEdge {
     line: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphNode {
+    schema: String,
+    id: String,
+    kind: String,
+    name: String,
+    path: Option<String>,
+    language: Option<Language>,
+    line: Option<usize>,
+    end_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphEdge {
+    schema: String,
+    kind: String,
+    source: String,
+    target: String,
+    line: Option<usize>,
+    confidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Freshness {
+    indexed_head: String,
+    current_head: String,
+    stale: bool,
+}
+
 pub fn index_project(
     repo_path: &str,
     languages: Option<Vec<String>>,
     force_rebuild: bool,
     clean_stale: bool,
+) -> Result<IndexProjectResponse> {
+    index_project_with_embeddings(
+        repo_path,
+        languages,
+        force_rebuild,
+        clean_stale,
+        EmbeddingOptions::default(),
+    )
+}
+
+pub fn index_project_with_embeddings(
+    repo_path: &str,
+    languages: Option<Vec<String>>,
+    force_rebuild: bool,
+    clean_stale: bool,
+    embedding_options: EmbeddingOptions,
 ) -> Result<IndexProjectResponse> {
     let root = Path::new(repo_path);
     if !root.is_dir() {
@@ -154,6 +205,8 @@ pub fn index_project(
     let mut total_hits = 0;
     let mut total_misses = 0;
     let mut referenced_cache_files = HashSet::new();
+    let mut embedding_sources = Vec::new();
+    let mut indexed_files = Vec::new();
 
     let files = all_supported_source_files(root)?
         .into_iter()
@@ -179,10 +232,18 @@ pub fn index_project(
         {
             let rel_path = rel_string(root, path)?;
             let file_hash = hash_file(path)?;
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                    warnings.push(format!("skipped non-UTF-8 source file `{rel_path}`: {err}"));
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
             let cache_file_name = format!("{}.json", file_hash.value);
             let cache_file = files_dir.join(&cache_file_name);
             let maybe_cached = (!force_rebuild)
-                .then(|| read_cached_file(&cache_file, &file_hash, &rel_path))
+                .then(|| read_cached_file(&cache_file, &file_hash, &rel_path, &mut warnings))
                 .transpose()?
                 .flatten();
 
@@ -196,8 +257,14 @@ pub fn index_project(
             };
 
             referenced_cache_files.insert(cache_file);
+            embedding_sources.push(EmbeddingSource {
+                path: rel_path,
+                content_hash: file_hash.value.clone(),
+                content,
+            });
             write_json_atomic(&files_dir.join(cache_file_name), &fact)?;
             modules.push(module_from_fact(&fact));
+            indexed_files.push((path.clone(), language));
             facts.push(fact);
         }
 
@@ -230,10 +297,17 @@ pub fn index_project(
         0
     };
 
-    let manifest = project_manifest(&summaries, &modules);
+    let embedding_config = embeddings::config_for_repo(root, embedding_options)?;
+    let embedding_stats =
+        embeddings::index_embeddings(root, &embedding_config, &embedding_sources)?;
+    warnings.extend(embedding_stats.warnings);
+
+    let source_modules = source_modules(root, &ctx, &indexed_files)?;
+    let manifest = project_manifest(root, &summaries, &source_modules);
     let manifest_path = cache_root.join("project_manifest.json");
     write_json_atomic(&manifest_path, &manifest)?;
-    update_agents_md(root, &summaries, &cache_root, &manifest_path)?;
+    update_agents_md(root, &summaries, &cache_root, &manifest_path, &mut warnings)?;
+    write_workflow_docs(root)?;
 
     warnings.extend(
         project_config::configured_languages(root)?
@@ -333,7 +407,11 @@ fn language_index(language: Language, facts: &[CachedFileFacts]) -> LanguageInde
     }
 }
 
-fn project_manifest(summaries: &[LanguageIndexSummary], modules: &[ModuleDef]) -> ProjectManifest {
+fn project_manifest(
+    root: &Path,
+    summaries: &[LanguageIndexSummary],
+    modules: &[ModuleDef],
+) -> ProjectManifest {
     let resolver = LocalModuleResolver::new(modules);
     let module_by_name = modules
         .iter()
@@ -405,6 +483,9 @@ fn project_manifest(summaries: &[LanguageIndexSummary], modules: &[ModuleDef]) -
         })
         .collect::<Vec<_>>();
     project_modules.sort_by(|a, b| a.id.cmp(&b.id));
+    let (nodes, graph_edges) = graph_shape(modules, &resolver, &edges, &unresolved_imports);
+    let processes = derive_processes(modules, &resolver);
+    let freshness = freshness(root);
 
     ProjectManifest {
         header: cache_header(),
@@ -419,7 +500,167 @@ fn project_manifest(summaries: &[LanguageIndexSummary], modules: &[ModuleDef]) -
         modules: project_modules,
         edges,
         unresolved_imports,
+        nodes,
+        graph_edges,
+        processes,
+        freshness,
     }
+}
+
+fn graph_shape(
+    modules: &[ModuleDef],
+    resolver: &LocalModuleResolver,
+    imports: &[ProjectImportEdge],
+    unresolved: &[ProjectImportEdge],
+) -> (Vec<GraphNode>, Vec<GraphEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for module in modules {
+        let file_id = file_node_id(module);
+        let module_name = resolver.module_name_for(module);
+        let module_id = format!("module:{module_name}");
+        let path = module.path.to_string_lossy().replace('\\', "/");
+        nodes.push(GraphNode {
+            schema: "graph_node".to_string(),
+            id: file_id.clone(),
+            kind: "file".to_string(),
+            name: path.clone(),
+            path: Some(path.clone()),
+            language: Some(module.language),
+            line: None,
+            end_line: None,
+        });
+        nodes.push(GraphNode {
+            schema: "graph_node".to_string(),
+            id: module_id.clone(),
+            kind: "module".to_string(),
+            name: module_name,
+            path: Some(path),
+            language: Some(module.language),
+            line: None,
+            end_line: None,
+        });
+        edges.push(GraphEdge {
+            schema: "graph_edge".to_string(),
+            kind: "DEFINES".to_string(),
+            source: file_id,
+            target: module_id.clone(),
+            line: None,
+            confidence: "high".to_string(),
+        });
+
+        for def in &module.defs {
+            let symbol_id = symbol_node_id(module, def);
+            nodes.push(GraphNode {
+                schema: "graph_node".to_string(),
+                id: symbol_id.clone(),
+                kind: "symbol".to_string(),
+                name: def.name.clone(),
+                path: Some(module.path.to_string_lossy().replace('\\', "/")),
+                language: Some(module.language),
+                line: Some(def.line),
+                end_line: Some(def.end_line),
+            });
+            edges.push(GraphEdge {
+                schema: "graph_edge".to_string(),
+                kind: "DEFINES".to_string(),
+                source: module_id.clone(),
+                target: symbol_id,
+                line: Some(def.line),
+                confidence: "high".to_string(),
+            });
+        }
+    }
+
+    for edge in call_edges(modules, resolver) {
+        edges.push(GraphEdge {
+            schema: "graph_edge".to_string(),
+            kind: "CALLS".to_string(),
+            source: format!(
+                "symbol:{}:{}:{}",
+                Language::from_path(Path::new(&edge.source_file))
+                    .map(|language| language.config_name())
+                    .unwrap_or("unknown"),
+                edge.source_file,
+                edge.source_symbol
+            ),
+            target: format!(
+                "symbol:{}:{}:{}",
+                crate::context::Language::from_path(Path::new(&edge.target_file))
+                    .map(|language| language.config_name())
+                    .unwrap_or("unknown"),
+                edge.target_file,
+                edge.target_symbol
+            ),
+            line: Some(edge.call_line),
+            confidence: "medium".to_string(),
+        });
+    }
+
+    for edge in imports {
+        if edge.target_id.is_some() {
+            edges.push(GraphEdge {
+                schema: "graph_edge".to_string(),
+                kind: "IMPORTS".to_string(),
+                source: format!("module:{}", edge.source_module),
+                target: format!("module:{}", edge.target_module),
+                line: Some(edge.line),
+                confidence: "high".to_string(),
+            });
+        }
+    }
+    for edge in unresolved {
+        edges.push(GraphEdge {
+            schema: "graph_edge".to_string(),
+            kind: "UNRESOLVED_IMPORT".to_string(),
+            source: format!("module:{}", edge.source_module),
+            target: edge.target_module.clone(),
+            line: Some(edge.line),
+            confidence: "low".to_string(),
+        });
+    }
+
+    nodes.sort_by(|a, b| a.id.cmp(&b.id));
+    nodes.dedup_by(|a, b| a.id == b.id);
+    edges.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    edges.dedup();
+    (nodes, edges)
+}
+
+fn file_node_id(module: &ModuleDef) -> String {
+    format!("file:{}", module.path.to_string_lossy().replace('\\', "/"))
+}
+
+fn symbol_node_id(module: &ModuleDef, def: &Definition) -> String {
+    format!(
+        "symbol:{}:{}:{}",
+        module.language.config_name(),
+        module.path.to_string_lossy().replace('\\', "/"),
+        def.name
+    )
+}
+
+fn freshness(root: &Path) -> Freshness {
+    let (indexed_head, current_head) = git_head(root).unwrap_or_else(|| {
+        let value = "unknown".to_string();
+        (value.clone(), value)
+    });
+    Freshness {
+        stale: indexed_head != current_head,
+        indexed_head,
+        current_head,
+    }
+}
+
+fn git_head(root: &Path) -> Option<(String, String)> {
+    let repo = git2::Repository::discover(root).ok()?;
+    let head = repo.head().ok()?.target()?.to_string();
+    Some((head.clone(), head))
 }
 
 fn module_id(language: Language, path: &Path) -> String {
@@ -434,6 +675,7 @@ fn read_cached_file(
     cache_file: &Path,
     expected_hash: &FileHash,
     expected_path: &str,
+    warnings: &mut Vec<String>,
 ) -> Result<Option<CachedFileFacts>> {
     if !cache_file.exists() {
         return Ok(None);
@@ -441,10 +683,25 @@ fn read_cached_file(
     let source = match std::fs::read_to_string(cache_file) {
         Ok(source) => source,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+        Err(err) => {
+            warnings.push(format!(
+                "ignored unreadable cache file `{}`: {}",
+                cache_file.display(),
+                err
+            ));
+            return Ok(None);
+        }
     };
-    let Ok(fact) = serde_json::from_str::<CachedFileFacts>(&source) else {
-        return Ok(None);
+    let fact = match serde_json::from_str::<CachedFileFacts>(&source) {
+        Ok(fact) => fact,
+        Err(err) => {
+            warnings.push(format!(
+                "ignored corrupt cache file `{}`: {}",
+                cache_file.display(),
+                err
+            ));
+            return Ok(None);
+        }
     };
     if fact.header == cache_header()
         && fact.content_hash == *expected_hash
@@ -474,6 +731,19 @@ fn cache_header() -> CacheHeader {
     }
 }
 
+fn source_modules(
+    root: &Path,
+    ctx: &Context,
+    files: &[(PathBuf, Language)],
+) -> Result<Vec<ModuleDef>> {
+    let mut modules = Vec::new();
+    for (path, _) in files {
+        modules.push(ctx.get_or_parse(rel_string(root, path)?)?);
+    }
+    modules.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(modules)
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -489,10 +759,22 @@ fn update_agents_md(
     summaries: &[LanguageIndexSummary],
     cache_root: &Path,
     manifest_path: &Path,
+    warnings: &mut Vec<String>,
 ) -> Result<()> {
     let agents_path = root.join("AGENTS.md");
     let existing = if agents_path.exists() {
-        std::fs::read_to_string(&agents_path)?
+        match std::fs::read_to_string(&agents_path) {
+            Ok(existing) => existing,
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                warnings.push(format!(
+                    "skipped AGENTS.md update because `{}` is not valid UTF-8: {}",
+                    agents_path.display(),
+                    err
+                ));
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        }
     } else {
         "# AGENTS.md\n".to_string()
     };
@@ -516,6 +798,9 @@ fn agents_index_section(
 RustRank indexed this repository with language-specific analyzers. Use the persistent cache and project manifest for repository-level symbol/import context before broad code changes.\n\n\
 Persistent index cache: `{cache_dir}/`\n\
 Project manifest: `{manifest}`\n\n\
+MCP resources: `rustrank://repo/current/context`, `rustrank://repo/current/schema`, `rustrank://repo/current/modules`, `rustrank://repo/current/module/{{name}}`, `rustrank://repo/current/processes`, and `rustrank://repo/current/process/{{name}}`.\n\n\
+Agent-facing tools: `context`, `impact`, `detect_changes`, and `query`. Use `context` before editing a symbol, `impact` before changing shared APIs, `detect_changes` before final review, and `query` for graph-aware repository search.\n\n\
+Workflow docs: `.rustrank/skills/exploring.md`, `.rustrank/skills/impact-analysis.md`, `.rustrank/skills/debugging.md`, `.rustrank/skills/refactoring.md`.\n\n\
 Language index shards:\n\n\
 | Language | Files | Symbols | Imports |\n\
 | --- | ---: | ---: | ---: |\n",
@@ -532,11 +817,37 @@ Language index shards:\n\n\
     }
 
     section.push_str(
-        "\nThe cache stores per-file symbols, imports, declared namespaces, content hashes, and language metadata. It does not store source lines, snippets, absolute paths, or timestamps. Re-run `index_project` after source changes to refresh this section and the persistent cache.\n",
+        "\nThe cache stores per-file symbols, imports, declared namespaces, content hashes, graph nodes, graph edges, and git freshness metadata. It does not store source lines, snippets, or absolute paths. Re-run `index_project` after source changes to refresh this section and the persistent cache.\n",
     );
     section.push_str(AGENTS_SECTION_END);
     section.push('\n');
     Ok(section)
+}
+
+fn write_workflow_docs(root: &Path) -> Result<()> {
+    let dir = root.join(".rustrank/skills");
+    std::fs::create_dir_all(&dir)?;
+    for (name, body) in [
+        (
+            "exploring.md",
+            "# RustRank Exploring\n\n1. Run `index_project`.\n2. Read `rustrank://repo/current/context`.\n3. Use `query` to find entry points and central modules.\n",
+        ),
+        (
+            "impact-analysis.md",
+            "# RustRank Impact Analysis\n\n1. Use `context` for the target symbol.\n2. Use `impact` with an appropriate depth.\n3. Verify high-confidence edges against source before editing.\n",
+        ),
+        (
+            "debugging.md",
+            "# RustRank Debugging\n\n1. Search errors with existing trace tools.\n2. Use `query` for related code.\n3. Use `context` and `impact` to inspect likely symbols and callers.\n",
+        ),
+        (
+            "refactoring.md",
+            "# RustRank Refactoring\n\n1. Use `impact` before changing public symbols.\n2. Make the smallest source change.\n3. Run `detect_changes` and tests before finalizing.\n",
+        ),
+    ] {
+        std::fs::write(dir.join(name), body)?;
+    }
+    Ok(())
 }
 
 fn repo_relative_path(root: &Path, path: &Path) -> Result<String> {

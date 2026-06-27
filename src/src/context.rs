@@ -822,13 +822,6 @@ fn parse_tree_sitter_module(
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| AppError::Context(format!("failed to parse {}", path.display())))?;
-    if tree.root_node().has_error() {
-        return Err(AppError::Context(format!(
-            "Tree-sitter parse error in {}",
-            path.display()
-        )));
-    }
-
     let mut imports = Vec::new();
     let mut defs = Vec::new();
     collect_tree_sitter(tree.root_node(), language, source, &mut imports, &mut defs);
