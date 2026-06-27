@@ -651,15 +651,160 @@ fn is_ignored_path(path: &Path) -> bool {
 }
 
 fn parse_python_module(path: &Path, source: &str) -> Result<(Vec<Import>, Vec<Definition>)> {
-    let suite =
-        ast::Suite::parse(source, &path.to_string_lossy()).map_err(|source| AppError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    Ok((
-        extract_imports_from_suite(&suite, source),
-        extract_defs_from_suite(&suite, source),
-    ))
+    match ast::Suite::parse(source, &path.to_string_lossy()) {
+        Ok(suite) => Ok((
+            extract_imports_from_suite(&suite, source),
+            extract_defs_from_suite(&suite, source),
+        )),
+        Err(source_err) => {
+            let (imports, defs) = parse_python_with_tree_sitter(path, source)
+                .unwrap_or_else(|_| lazy_parse_python_module(source));
+            if imports.is_empty() && defs.is_empty() {
+                Err(AppError::Parse {
+                    path: path.to_path_buf(),
+                    source: source_err,
+                })
+            } else {
+                Ok((imports, defs))
+            }
+        }
+    }
+}
+
+fn parse_python_with_tree_sitter(
+    path: &Path,
+    source: &str,
+) -> Result<(Vec<Import>, Vec<Definition>)> {
+    let mut parser = Parser::new();
+    let parser_language = tree_sitter_language(Language::Python, path).ok_or_else(|| {
+        AppError::Validation(format!(
+            "unsupported Tree-sitter language: {:?}",
+            Language::Python
+        ))
+    })?;
+    parser
+        .set_language(&parser_language)
+        .map_err(|err| AppError::Context(err.to_string()))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| AppError::Context(format!("failed to parse {}", path.display())))?;
+
+    let mut imports = Vec::new();
+    let mut defs = Vec::new();
+    collect_tree_sitter(
+        tree.root_node(),
+        Language::Python,
+        source,
+        &mut imports,
+        &mut defs,
+    );
+    normalize_python_facts(&mut imports, &mut defs);
+    if imports.is_empty() && defs.is_empty() {
+        Ok(lazy_parse_python_module(source))
+    } else {
+        Ok((imports, defs))
+    }
+}
+
+fn lazy_parse_python_module(source: &str) -> (Vec<Import>, Vec<Definition>) {
+    let mut imports = Vec::new();
+    let mut defs = Vec::new();
+    for (idx, line) in source.lines().enumerate() {
+        let line_no = idx + 1;
+        collect_lazy_python_imports(line, line_no, &mut imports);
+        if let Some(def) = lazy_python_def(line, line_no) {
+            defs.push(def);
+        }
+    }
+    normalize_python_facts(&mut imports, &mut defs);
+    (imports, defs)
+}
+
+fn normalize_python_facts(imports: &mut Vec<Import>, defs: &mut Vec<Definition>) {
+    imports.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then_with(|| a.module.cmp(&b.module))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    imports.dedup_by(|a, b| a.line == b.line && a.module == b.module && a.name == b.name);
+    defs.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
+    defs.dedup_by(|a, b| a.line == b.line && a.name == b.name && a.kind == b.kind);
+}
+
+fn collect_lazy_python_imports(line: &str, line_no: usize, imports: &mut Vec<Import>) {
+    let trimmed = strip_python_comment(line).trim();
+    if let Some(rest) = trimmed.strip_prefix("import ") {
+        for module in rest.split(',').filter_map(python_import_name) {
+            imports.push(Import {
+                module,
+                name: None,
+                line: line_no,
+            });
+        }
+        return;
+    }
+
+    let Some(rest) = trimmed.strip_prefix("from ") else {
+        return;
+    };
+    let Some((module, names)) = rest.split_once(" import ") else {
+        return;
+    };
+    let module = module.trim();
+    if module.is_empty() {
+        return;
+    }
+    for name in names.split(',').filter_map(python_import_name) {
+        imports.push(Import {
+            module: module.to_string(),
+            name: Some(name),
+            line: line_no,
+        });
+    }
+}
+
+fn lazy_python_def(line: &str, line_no: usize) -> Option<Definition> {
+    let trimmed = strip_python_comment(line).trim();
+    let (kind, rest) = if let Some(rest) = trimmed.strip_prefix("async def ") {
+        (DefKind::Func, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("def ") {
+        (DefKind::Func, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("class ") {
+        let name_end = rest.find(['(', ':']).unwrap_or(rest.len());
+        let kind = if rest[name_end..].trim_start().starts_with('(') {
+            DefKind::Struct
+        } else {
+            DefKind::Class
+        };
+        (kind, rest)
+    } else {
+        return None;
+    };
+
+    let name_end = rest.find(['(', ':']).unwrap_or(rest.len());
+    let name = rest[..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(Definition {
+        name: name.to_string(),
+        kind,
+        line: line_no,
+        end_line: line_no,
+        has_args: rest[name_end..].trim_start().starts_with('('),
+    })
+}
+
+fn python_import_name(value: &str) -> Option<String> {
+    let name = value.trim().split(" as ").next().unwrap_or_default().trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn strip_python_comment(line: &str) -> &str {
+    line.split_once('#')
+        .map(|(before, _)| before)
+        .unwrap_or(line)
 }
 
 fn parse_tree_sitter_module(
@@ -701,7 +846,7 @@ fn parse_tree_sitter_module(
 
 fn tree_sitter_language(language: Language, path: &Path) -> Option<tree_sitter::Language> {
     match language {
-        Language::Python => None,
+        Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
         Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         Language::TypeScript
@@ -724,17 +869,44 @@ fn collect_tree_sitter(
     defs: &mut Vec<Definition>,
 ) {
     match language {
+        Language::Python => collect_python_node(node, source, imports, defs),
         Language::Rust => collect_rust_node(node, source, imports, defs),
         Language::CSharp => collect_csharp_node(node, source, imports, defs),
         Language::TypeScript | Language::JavaScript => {
             collect_js_ts_node(node, language, source, imports, defs);
         }
-        Language::Python => {}
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_tree_sitter(child, language, source, imports, defs);
+    }
+}
+
+fn collect_python_node(
+    node: Node<'_>,
+    source: &str,
+    imports: &mut Vec<Import>,
+    defs: &mut Vec<Definition>,
+) {
+    match node.kind() {
+        "import_statement" | "import_from_statement" => {
+            collect_lazy_python_imports(
+                node_text(node, source),
+                start_line_for_node(node),
+                imports,
+            );
+        }
+        "function_definition" => push_tree_sitter_def(node, source, DefKind::Func, defs),
+        "class_definition" => {
+            let kind = if node_text(node, source).contains('(') {
+                DefKind::Struct
+            } else {
+                DefKind::Class
+            };
+            push_tree_sitter_def(node, source, kind, defs);
+        }
+        _ => {}
     }
 }
 
