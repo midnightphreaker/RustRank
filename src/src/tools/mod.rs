@@ -6,6 +6,7 @@ pub mod trace;
 
 use std::net::SocketAddr;
 
+use axum::routing::get;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -16,6 +17,11 @@ use rmcp::{
     },
 };
 use serde::Deserialize;
+
+const DEFAULT_HTTP_HOST: &str = "127.0.0.1";
+const DEFAULT_HTTP_PORT: &str = "63477";
+const DEFAULT_MCP_PATH: &str = "/mcp";
+const HEALTH_PATH: &str = "/healthz";
 
 pub const ALL_TOOLS: &[&str] = &[
     "contextual_search",
@@ -339,25 +345,166 @@ async fn serve_stdio() -> anyhow::Result<()> {
 }
 
 async fn serve_streamable_http() -> anyhow::Result<()> {
-    let addr = std::env::var("RUSTRANK_LISTEN_ADDR")
-        .or_else(|_| std::env::var("RUSTANK_LISTEN_ADDR"))
-        .unwrap_or_else(|_| "127.0.0.1:63477".to_string());
-    let addr: SocketAddr = addr.parse()?;
-    let allowed_hosts = allowed_hosts_for(addr);
+    let http_config = HttpRuntimeConfig::from_env()?;
+    let server_config =
+        streamable_http_server_config(http_config.allowed_hosts, http_config.allowed_origins);
+    let server_config = if http_config.disable_host_check {
+        server_config.disable_allowed_hosts()
+    } else {
+        server_config
+    };
     let service: StreamableHttpService<RustRankRouter, LocalSessionManager> =
         StreamableHttpService::new(
             || Ok(RustRankRouter::new()),
             Default::default(),
-            StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+            server_config,
         );
-    let app = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let app = axum::Router::new()
+        .route(HEALTH_PATH, get(|| async { "ok\n" }))
+        .nest_service(&http_config.mcp_path, service);
+    let listener = tokio::net::TcpListener::bind(http_config.addr).await?;
     eprintln!(
-        "RustRank Streamable HTTP listening on http://{}/mcp",
-        listener.local_addr()?
+        "RustRank Streamable HTTP listening on http://{}{}",
+        listener.local_addr()?,
+        http_config.mcp_path
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct HttpRuntimeConfig {
+    addr: SocketAddr,
+    mcp_path: String,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    disable_host_check: bool,
+}
+
+impl HttpRuntimeConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        let listen_addr = env_var("RUSTRANK_LISTEN_ADDR", "RUSTANK_LISTEN_ADDR");
+        let host = env_var("RUSTRANK_HOST", "RUSTANK_HOST");
+        let port = env_var("RUSTRANK_PORT", "RUSTANK_PORT");
+        let addr =
+            listen_addr_from_values(listen_addr.as_deref(), host.as_deref(), port.as_deref())?;
+        let mcp_path =
+            mcp_path_from_value(env_var("RUSTRANK_MCP_PATH", "RUSTANK_MCP_PATH").as_deref())?;
+
+        let mut allowed_hosts = allowed_hosts_for(addr);
+        allowed_hosts.extend(parse_csv_list(
+            env_var("RUSTRANK_ALLOWED_HOSTS", "RUSTANK_ALLOWED_HOSTS").as_deref(),
+        ));
+        allowed_hosts.sort();
+        allowed_hosts.dedup();
+
+        let allowed_origins = parse_csv_list(
+            env_var("RUSTRANK_ALLOWED_ORIGINS", "RUSTANK_ALLOWED_ORIGINS").as_deref(),
+        );
+        let disable_host_check = bool_from_value(
+            env_var("RUSTRANK_DISABLE_HOST_CHECK", "RUSTANK_DISABLE_HOST_CHECK").as_deref(),
+        );
+
+        Ok(Self {
+            addr,
+            mcp_path,
+            allowed_hosts,
+            allowed_origins,
+            disable_host_check,
+        })
+    }
+}
+
+fn streamable_http_server_config(
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+) -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_sse_retry(None)
+        .with_allowed_hosts(allowed_hosts)
+        .with_allowed_origins(allowed_origins)
+}
+
+fn listen_addr_from_values(
+    listen_addr: Option<&str>,
+    host: Option<&str>,
+    port: Option<&str>,
+) -> anyhow::Result<SocketAddr> {
+    let raw_addr = match non_empty_trimmed(listen_addr) {
+        Some(addr) => addr.to_string(),
+        None => {
+            let host = non_empty_trimmed(host).unwrap_or(DEFAULT_HTTP_HOST);
+            let port = non_empty_trimmed(port).unwrap_or(DEFAULT_HTTP_PORT);
+            format!("{host}:{port}")
+        }
+    };
+
+    raw_addr
+        .parse()
+        .map_err(|err| anyhow::anyhow!("invalid RustRank listen address {raw_addr:?}: {err}"))
+}
+
+fn mcp_path_from_value(value: Option<&str>) -> anyhow::Result<String> {
+    let raw = non_empty_trimmed(value).unwrap_or(DEFAULT_MCP_PATH);
+    let mut path = if raw.starts_with('/') {
+        raw.to_string()
+    } else {
+        format!("/{raw}")
+    };
+
+    while path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+
+    if path == "/" {
+        return Err(anyhow::anyhow!("RustRank MCP path must not be /"));
+    }
+    if path == HEALTH_PATH {
+        return Err(anyhow::anyhow!(
+            "RustRank MCP path {HEALTH_PATH:?} is reserved for health checks"
+        ));
+    }
+
+    Ok(path)
+}
+
+fn parse_csv_list(value: Option<&str>) -> Vec<String> {
+    let mut values = Vec::new();
+    let Some(value) = value else {
+        return values;
+    };
+
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        if !values.iter().any(|value| value == item) {
+            values.push(item.to_string());
+        }
+    }
+
+    values
+}
+
+fn bool_from_value(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn env_var(primary: &str, legacy: &str) -> Option<String> {
+    std::env::var(primary)
+        .or_else(|_| std::env::var(legacy))
+        .ok()
 }
 
 fn allowed_hosts_for(addr: SocketAddr) -> Vec<String> {
@@ -415,5 +562,47 @@ mod tests {
 
         assert!(hosts.iter().any(|host| host == "127.0.0.1"));
         assert!(hosts.iter().any(|host| host == "127.0.0.1:63477"));
+    }
+
+    #[test]
+    fn streamable_http_server_config_disables_sse() {
+        let config = streamable_http_server_config(vec!["localhost".to_string()], vec![]);
+
+        assert!(!config.stateful_mode);
+        assert!(config.json_response);
+        assert!(config.sse_keep_alive.is_none());
+        assert!(config.sse_retry.is_none());
+        assert_eq!(config.allowed_hosts, vec!["localhost"]);
+    }
+
+    #[test]
+    fn listen_addr_prefers_full_addr_over_host_and_port() {
+        let addr = listen_addr_from_values(Some("0.0.0.0:9000"), Some("127.0.0.1"), Some("63477"))
+            .expect("addr");
+
+        assert_eq!(addr, "0.0.0.0:9000".parse::<SocketAddr>().expect("parse"));
+    }
+
+    #[test]
+    fn listen_addr_uses_host_and_port_when_full_addr_missing() {
+        let addr = listen_addr_from_values(None, Some("0.0.0.0"), Some("7777")).expect("addr");
+
+        assert_eq!(addr, "0.0.0.0:7777".parse::<SocketAddr>().expect("parse"));
+    }
+
+    #[test]
+    fn mcp_path_defaults_and_requires_absolute_path() {
+        assert_eq!(mcp_path_from_value(None).expect("default"), "/mcp");
+        assert_eq!(
+            mcp_path_from_value(Some("custom")).expect("normalized"),
+            "/custom"
+        );
+    }
+
+    #[test]
+    fn comma_separated_values_are_trimmed_and_deduplicated() {
+        let values = parse_csv_list(Some(" api.example.test, localhost, api.example.test ,, "));
+
+        assert_eq!(values, vec!["api.example.test", "localhost"]);
     }
 }

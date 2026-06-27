@@ -1,0 +1,10 @@
+.git
+target
+**/target
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.tmp
+*.log
+.DS_Store

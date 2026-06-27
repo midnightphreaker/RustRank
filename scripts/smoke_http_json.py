@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""Smoke-test RustRank over no-SSE Streamable HTTP JSON responses."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+from urllib import error, request
+
+PROTOCOL_VERSION = "2025-06-18"
+
+EXPECTED_TOOLS = [
+    "contextual_search",
+    "smart_code_search",
+    "api_usage",
+    "coderank_analysis",
+    "code_hotspots",
+    "trace_data_flow",
+    "trace_feature_impl",
+    "trace_dep_impact",
+    "error_patterns",
+    "perf_bottleneck",
+    "exec_paths",
+    "execute_paths",
+    "get_config",
+    "set_config",
+]
+
+
+class SmokeFailure(RuntimeError):
+    pass
+
+
+def write_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
+
+
+def write_fixture(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    write_file(
+        root / "pkg" / "core.py",
+        r'''
+        import time
+        from pkg.models import User
+
+        class Service:
+            def login(self, user_id, email):
+                if not user_id:
+                    raise ValueError("missing user_id")
+                for item in range(3):
+                    time.sleep(0.01)
+                return User(user_id, email)
+
+        def authenticate(user_id, email):
+            try:
+                svc = Service()
+                return svc.login(user_id, email)
+            except ValueError as err:
+                raise RuntimeError("login failed") from err
+        ''',
+    )
+    write_file(
+        root / "pkg" / "models.py",
+        r'''
+        class User:
+            def __init__(self, user_id, email):
+                self.user_id = user_id
+                self.email = email
+        ''',
+    )
+    write_file(
+        root / "pkg" / "api.py",
+        r'''
+        from pkg.core import authenticate
+
+        def login_endpoint(request):
+            user_id = request["user_id"]
+            email = request["email"]
+            return authenticate(user_id, email)
+        ''',
+    )
+    write_file(
+        root / "src" / "lib.rs",
+        r'''
+        use crate::service::Authenticator;
+
+        pub struct RustUser {
+            pub user_id: String,
+        }
+
+        pub fn login_user(user_id: &str) -> RustUser {
+            if user_id.is_empty() {
+                panic!("missing user_id");
+            }
+            Authenticator::new().login(user_id)
+        }
+        ''',
+    )
+    write_file(
+        root / "src" / "service.rs",
+        r'''
+        pub struct Authenticator;
+
+        impl Authenticator {
+            pub fn new() -> Self {
+                Self
+            }
+
+            pub fn login(&self, user_id: &str) -> crate::RustUser {
+                crate::RustUser {
+                    user_id: user_id.to_string(),
+                }
+            }
+        }
+        ''',
+    )
+    write_file(
+        root / "app" / "Controller.cs",
+        r'''
+        using App.Services;
+
+        namespace App.Controllers;
+
+        public class LoginController {
+            private readonly AuthService service = new AuthService();
+
+            public UserDto Login(string userId) {
+                if (string.IsNullOrEmpty(userId)) {
+                    throw new ArgumentException("missing userId");
+                }
+                return service.Login(userId);
+            }
+        }
+        ''',
+    )
+    write_file(
+        root / "app" / "AuthService.cs",
+        r'''
+        namespace App.Services;
+
+        public record UserDto(string UserId);
+
+        public class AuthService {
+            public UserDto Login(string userId) {
+                return new UserDto(userId);
+            }
+        }
+        ''',
+    )
+    write_file(
+        root / "web" / "auth.ts",
+        r'''
+        import { AuditLogger } from "./logger";
+
+        export interface Session {
+            userId: string;
+        }
+
+        export function loginUser(userId: string): Session {
+            if (!userId) {
+                throw new Error("missing userId");
+            }
+            AuditLogger.record(userId);
+            return { userId };
+        }
+        ''',
+    )
+    write_file(
+        root / "web" / "logger.tsx",
+        r'''
+        export class AuditLogger {
+            static record(userId: string): void {
+                console.log(userId);
+            }
+        }
+
+        export const LoginView = () => <button>Login</button>;
+        ''',
+    )
+    write_file(
+        root / "web" / "auth.js",
+        r'''
+        const { formatUser } = require("./format");
+
+        export function loginBrowser(userId) {
+            if (!userId) {
+                throw new Error("missing userId");
+            }
+            return formatUser(userId);
+        }
+        ''',
+    )
+    write_file(
+        root / "web" / "format.jsx",
+        r'''
+        export class Formatter {
+            render(userId) {
+                return <span>{userId}</span>;
+            }
+        }
+
+        export const formatUser = (userId) => ({ userId });
+        ''',
+    )
+
+
+def maybe_commit_fixture(root: Path) -> None:
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "add", "."], cwd=root, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=RustRank Smoke",
+                "-c",
+                "user.email=rustrank-smoke@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "initial fixture",
+            ],
+            cwd=root,
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+
+def rpc(url: str, method: str, params: object | None, request_id: int) -> dict:
+    payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    body = json.dumps(payload).encode("utf-8")
+    http_request = request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": PROTOCOL_VERSION,
+        },
+    )
+
+    try:
+        with request.urlopen(http_request, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "")
+            response_body = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        raise SmokeFailure(f"{method} returned HTTP {exc.code}: {response_body}") from exc
+    except error.URLError as exc:
+        raise SmokeFailure(f"{method} failed to connect: {exc}") from exc
+
+    if "text/event-stream" in content_type:
+        raise SmokeFailure(f"{method} returned SSE content type: {content_type}")
+    if "application/json" not in content_type:
+        raise SmokeFailure(f"{method} returned non-JSON content type: {content_type}")
+
+    try:
+        decoded = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise SmokeFailure(f"{method} returned invalid JSON: {response_body}") from exc
+
+    if decoded.get("error"):
+        raise SmokeFailure(f"{method} returned JSON-RPC error: {decoded['error']}")
+    if "result" not in decoded:
+        raise SmokeFailure(f"{method} returned no result: {decoded}")
+
+    return decoded["result"]
+
+
+def call_tool(url: str, request_id: int, name: str, arguments: dict) -> None:
+    result = rpc(url, "tools/call", {"name": name, "arguments": arguments}, request_id)
+    if result.get("isError"):
+        raise SmokeFailure(f"{name} returned MCP tool error: {result}")
+
+    content = result.get("content", [])
+    if not content:
+        raise SmokeFailure(f"{name} returned no content")
+
+    for item in content:
+        if item.get("type") != "text":
+            continue
+        text = item.get("text", "")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("error"):
+            raise SmokeFailure(f"{name} returned RustRank error: {parsed['error']}")
+
+
+def tool_calls(repo_path: str) -> list[tuple[str, dict]]:
+    return [
+        (
+            "contextual_search",
+            {
+                "path": repo_path,
+                "pattern": "authenticate",
+                "file_type": "py",
+                "is_regex": False,
+                "num_context_lines": 1,
+            },
+        ),
+        (
+            "smart_code_search",
+            {
+                "repo_path": repo_path,
+                "pattern": "login",
+                "context_lines": 1,
+                "num_context_lines": 10,
+            },
+        ),
+        (
+            "api_usage",
+            {
+                "repo_path": repo_path,
+                "api_name": "authenticate",
+                "max_examples": 10,
+                "group_by_pattern": True,
+            },
+        ),
+        (
+            "coderank_analysis",
+            {
+                "repo_path": repo_path,
+                "top_n": 20,
+                "module_prefix": None,
+                "external_modules": True,
+            },
+        ),
+        (
+            "code_hotspots",
+            {"repo_path": repo_path, "top_n": 10, "min_connections": 1},
+        ),
+        (
+            "trace_data_flow",
+            {
+                "repo_path": repo_path,
+                "identifier": "user_id",
+                "include_transformations": True,
+                "include_side_effects": True,
+            },
+        ),
+        (
+            "trace_feature_impl",
+            {"repo_path": repo_path, "feature_keywords": ["login", "authenticate"]},
+        ),
+        (
+            "trace_dep_impact",
+            {"repo_path": repo_path, "target_module": "pkg.core"},
+        ),
+        (
+            "error_patterns",
+            {
+                "repo_path": repo_path,
+                "include_antipatterns": True,
+                "show_evolution": True,
+                "days_back": 36500,
+            },
+        ),
+        (
+            "perf_bottleneck",
+            {
+                "repo_path": repo_path,
+                "focus_areas": ["sleep"],
+                "include_utility": True,
+            },
+        ),
+        (
+            "exec_paths",
+            {
+                "repo_path": repo_path,
+                "function_name": "login",
+                "max_depth": 4,
+                "include_call_contexts": True,
+            },
+        ),
+        (
+            "execute_paths",
+            {
+                "repo_path": repo_path,
+                "function_name": "login",
+                "max_depth": 4,
+                "include_call_contexts": True,
+            },
+        ),
+        ("get_config", {"repo_path": repo_path}),
+        (
+            "set_config",
+            {"repo_path": repo_path, "key": "smoke_test", "value": {"ok": True}},
+        ),
+    ]
+
+
+def run_smoke(url: str, repo_path: str) -> None:
+    request_id = 1
+    rpc(
+        url,
+        "initialize",
+        {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "rustrank-smoke", "version": "1.0.0"},
+        },
+        request_id,
+    )
+    request_id += 1
+
+    tools_result = rpc(url, "tools/list", {}, request_id)
+    request_id += 1
+    names = sorted(tool["name"] for tool in tools_result.get("tools", []))
+    missing = sorted(set(EXPECTED_TOOLS) - set(names))
+    unexpected = sorted(set(names) - set(EXPECTED_TOOLS))
+    if missing or unexpected:
+        raise SmokeFailure(f"tool list mismatch, missing={missing}, unexpected={unexpected}")
+
+    for name, arguments in tool_calls(repo_path):
+        call_tool(url, request_id, name, arguments)
+        request_id += 1
+
+    print(f"initialized no-SSE Streamable HTTP endpoint: {url}")
+    print(f"listed {len(names)} tools")
+    print(f"called {len(EXPECTED_TOOLS)} tools successfully")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", required=True, help="MCP URL, for example http://127.0.0.1:63477/mcp")
+    parser.add_argument(
+        "--repo-path",
+        help="Repository path as seen by the MCP server. Defaults to the generated fixture path.",
+    )
+    parser.add_argument(
+        "--fixture-dir",
+        help="Directory where the test fixture should be created before calling the server.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.fixture_dir:
+            fixture_dir = Path(args.fixture_dir).resolve()
+            write_fixture(fixture_dir)
+            maybe_commit_fixture(fixture_dir)
+            run_smoke(args.url, args.repo_path or str(fixture_dir))
+        else:
+            with tempfile.TemporaryDirectory(prefix="rustrank-smoke-") as tmp:
+                fixture_dir = Path(tmp)
+                write_fixture(fixture_dir)
+                maybe_commit_fixture(fixture_dir)
+                run_smoke(args.url, args.repo_path or str(fixture_dir))
+    except SmokeFailure as exc:
+        print(f"smoke test failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
