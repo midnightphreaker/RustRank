@@ -80,6 +80,44 @@ fn context_parse_cache_extracts_imports_and_defs() {
 }
 
 #[test]
+fn context_parse_all_recovers_from_malformed_python() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.path().join("pkg/broken.py"),
+        r#"
+import os
+from pkg.models import User
+
+def broken():
+
+class Recoverable:
+    pass
+
+async def later(value):
+    return value
+"#,
+    )
+    .expect("broken python");
+    let ctx = Context::new(fixture.path().to_path_buf());
+
+    let modules = ctx.parse_all().expect("parse all with broken python");
+    let broken = modules
+        .iter()
+        .find(|module| module.path.ends_with("pkg/broken.py"))
+        .expect("broken module indexed");
+
+    assert!(
+        broken
+            .imports
+            .iter()
+            .any(|import| import.module == "pkg.models" && import.name.as_deref() == Some("User"))
+    );
+    assert!(broken.defs.iter().any(|def| def.name == "broken"));
+    assert!(broken.defs.iter().any(|def| def.name == "Recoverable"));
+    assert!(broken.defs.iter().any(|def| def.name == "later"));
+}
+
+#[test]
 fn context_parse_all_extracts_supported_languages() {
     let fixture = fixture();
     let ctx = Context::new(fixture.path().to_path_buf());
