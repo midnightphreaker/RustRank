@@ -19,7 +19,7 @@ extensions:
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
 
 Ignored directories include `.git`, `.rustrank`, `target`, `node_modules`,
-`dist`, and `build`.
+`dist`, `build`, `.venv`, `venv`, `__pycache__`, and `.pytest_cache`.
 
 ## Project Configuration
 
@@ -43,6 +43,18 @@ The typed language configuration lives under the top-level `languages` key:
 If `languages.enabled` is missing or empty, RustRank auto-detects languages
 from current source files. Unknown language names are ignored and reported as
 warnings by indexing.
+
+Source excludes can be extended with `excludes.paths` globs and
+`excludes.extensions` values:
+
+```json
+{
+  "excludes": {
+    "paths": [".tox/**", "generated/**"],
+    "extensions": ["sqlite", ".bin"]
+  }
+}
+```
 
 ## Persistent Index
 

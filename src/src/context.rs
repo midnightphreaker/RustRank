@@ -223,13 +223,14 @@ pub fn supported_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
 
 pub fn all_supported_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
     let mut files = Vec::new();
+    let excludes = project_config::configured_excludes(root)?;
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
         let path = entry.path();
-        if is_ignored_path(path) {
+        if excludes.is_excluded(root, path) {
             continue;
         }
         if let Some(language) = Language::from_path(path) {
@@ -639,15 +640,6 @@ fn raw_import_matches(import: &Import, target_module: &str) -> bool {
         return import.module == parent && import.name.as_deref() == Some(name);
     }
     import.name.as_deref() == Some(target_module)
-}
-
-fn is_ignored_path(path: &Path) -> bool {
-    path.components().any(|part| {
-        matches!(
-            part.as_os_str().to_string_lossy().as_ref(),
-            ".git" | ".rustrank" | "target" | "node_modules" | "dist" | "build"
-        )
-    })
 }
 
 fn parse_python_module(path: &Path, source: &str) -> Result<(Vec<Import>, Vec<Definition>)> {
