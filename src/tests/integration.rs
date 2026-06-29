@@ -239,6 +239,22 @@ fn context_parse_all_extracts_supported_languages() {
         .expect("c module");
     assert!(c.imports.iter().any(|import| import.module == "auth.h"));
     assert!(c.defs.iter().any(|def| def.name == "native_login"));
+    let c_header = modules
+        .iter()
+        .find(|module| module.path.ends_with("native/auth.h"))
+        .expect("c header module");
+    assert!(
+        c_header
+            .defs
+            .iter()
+            .any(|def| def.name == "native_login" && def.kind == DefKind::Func)
+    );
+    assert!(
+        c_header
+            .defs
+            .iter()
+            .any(|def| def.name == "XML_SetEncoding" && def.kind == DefKind::Func)
+    );
 
     let cpp = modules
         .iter()
@@ -250,13 +266,58 @@ fn context_parse_all_extracts_supported_languages() {
             .any(|import| import.module == "session.hpp")
     );
     assert!(cpp.defs.iter().any(|def| def.name == "format_user"));
+    let cpp_header = modules
+        .iter()
+        .find(|module| module.path.ends_with("native/session.hpp"))
+        .expect("cpp header module");
+    assert!(
+        cpp_header
+            .defs
+            .iter()
+            .any(|def| def.name == "DynamicArgList" && def.kind == DefKind::Class),
+        "{:?}",
+        cpp_header.defs
+    );
+    assert_eq!(
+        cpp_header
+            .defs
+            .iter()
+            .filter(|def| def.name == "DynamicArgList" && def.kind == DefKind::Class)
+            .count(),
+        1,
+        "{:?}",
+        cpp_header.defs
+    );
+    assert!(
+        !cpp_header
+            .defs
+            .iter()
+            .any(|def| matches!(def.name.as_str(), "FMT_EXPORT" | "namespace")),
+        "{:?}",
+        cpp_header.defs
+    );
 
     let go = modules
         .iter()
         .find(|module| module.path.ends_with("goapp/auth.go"))
         .expect("go module");
-    assert!(go.imports.iter().any(|import| import.module == "fmt"));
+    assert!(
+        go.imports
+            .iter()
+            .any(|import| import.module == "fmt" && import.line == 5)
+    );
+    assert!(go.imports.iter().any(|import| import.module
+        == "github.com/gin-gonic/gin/internal/fs"
+        && import.name.as_deref() == Some("filesystem")
+        && import.line == 6));
     assert!(go.defs.iter().any(|def| def.name == "GoUser"));
+    assert!(
+        go.defs
+            .iter()
+            .any(|def| def.name == "HandlerFunc" && def.kind == DefKind::Func),
+        "{:?}",
+        go.defs
+    );
     assert!(go.defs.iter().any(|def| def.name == "LoginUser"));
 }
 

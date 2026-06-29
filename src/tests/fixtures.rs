@@ -229,7 +229,16 @@ typedef struct NativeUser {
     const char *user_id;
 } NativeUser;
 
+typedef enum XML_Status {
+    XML_STATUS_ERROR,
+    XML_STATUS_OK
+} XML_Status;
+
+#define XMLPARSEAPI(type) type
+
 NativeUser native_login(const char *user_id);
+XMLPARSEAPI(enum XML_Status)
+XML_SetEncoding(const char *encoding);
 "#,
     )
     .expect("c header");
@@ -250,6 +259,17 @@ NativeUser native_login(const char *user_id) {
         root.join("native/session.hpp"),
         r#"
 #pragma once
+
+#define FMT_BEGIN_NAMESPACE namespace fmt {
+#define FMT_END_NAMESPACE }
+#define FMT_EXPORT
+
+FMT_BEGIN_NAMESPACE
+FMT_EXPORT class DynamicArgList {
+public:
+    int size() const;
+};
+FMT_END_NAMESPACE
 
 class Session {
 public:
@@ -280,15 +300,22 @@ std::string format_user(const std::string& user_id) {
         r#"
 package goapp
 
-import "fmt"
+import (
+    "fmt"
+    filesystem "github.com/gin-gonic/gin/internal/fs"
+)
 
 type GoUser struct {
     ID string
 }
 
+type HandlerFunc func(userID string) GoUser
+
 func LoginUser(userID string) GoUser {
     return GoUser{ID: fmt.Sprintf("%s", userID)}
 }
+
+func UseFilesystem(_ filesystem.FileSystem) {}
 "#,
     )
     .expect("go source");

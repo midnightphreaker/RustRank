@@ -862,7 +862,32 @@ fn parse_tree_sitter_module(
     imports.dedup_by(|a, b| a.line == b.line && a.module == b.module && a.name == b.name);
     defs.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
     defs.dedup_by(|a, b| a.line == b.line && a.name == b.name && a.kind == b.kind);
+    dedup_non_function_defs(&mut defs);
     Ok((imports, defs))
+}
+
+fn dedup_non_function_defs(defs: &mut Vec<Definition>) {
+    let mut deduped = Vec::<Definition>::new();
+    for def in defs.drain(..) {
+        if def.kind == DefKind::Func {
+            deduped.push(def);
+            continue;
+        }
+        if let Some(existing) = deduped
+            .iter_mut()
+            .find(|existing| existing.kind == def.kind && existing.name == def.name)
+        {
+            let existing_span = existing.end_line.saturating_sub(existing.line);
+            let def_span = def.end_line.saturating_sub(def.line);
+            if def_span < existing_span {
+                *existing = def;
+            }
+        } else {
+            deduped.push(def);
+        }
+    }
+    deduped.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
+    *defs = deduped;
 }
 
 fn tree_sitter_language(language: Language, path: &Path) -> Option<tree_sitter::Language> {
@@ -1007,15 +1032,18 @@ fn collect_c_node(
             }
         }
         "function_definition" => {
-            push_tree_sitter_def_with_name(
-                node,
-                source,
-                DefKind::Func,
-                c_declarator_name(node, source),
-                defs,
-            );
+            if let Some(name) = c_function_name(node, source) {
+                push_tree_sitter_def_with_name(node, source, DefKind::Func, Some(name), defs);
+            }
         }
-        "struct_specifier" => {
+        "declaration" => {
+            if !c_declaration_has_tag_body(node)
+                && let Some(name) = c_function_name(node, source)
+            {
+                push_tree_sitter_def_with_name(node, source, DefKind::Func, Some(name), defs);
+            }
+        }
+        "struct_specifier" if c_tag_has_body(node) => {
             push_tree_sitter_def_with_name(
                 node,
                 source,
@@ -1024,7 +1052,7 @@ fn collect_c_node(
                 defs,
             );
         }
-        "enum_specifier" => {
+        "enum_specifier" if c_tag_has_body(node) => {
             push_tree_sitter_def_with_name(
                 node,
                 source,
@@ -1054,15 +1082,22 @@ fn collect_cpp_node(
             }
         }
         "function_definition" => {
-            push_tree_sitter_def_with_name(
-                node,
-                source,
-                DefKind::Func,
-                c_declarator_name(node, source),
-                defs,
-            );
+            if let Some(name) = cpp_class_name_from_declaration(node_text(node, source)) {
+                push_tree_sitter_def_with_name(node, source, DefKind::Class, Some(name), defs);
+            } else if let Some(name) = c_function_name(node, source) {
+                push_tree_sitter_def_with_name(node, source, DefKind::Func, Some(name), defs);
+            }
         }
-        "class_specifier" => {
+        "declaration" => {
+            if let Some(name) = cpp_class_name_from_declaration(node_text(node, source)) {
+                push_tree_sitter_def_with_name(node, source, DefKind::Class, Some(name), defs);
+            } else if !c_declaration_has_tag_body(node)
+                && let Some(name) = c_function_name(node, source)
+            {
+                push_tree_sitter_def_with_name(node, source, DefKind::Func, Some(name), defs);
+            }
+        }
+        "class_specifier" if c_tag_has_body(node) => {
             push_tree_sitter_def_with_name(
                 node,
                 source,
@@ -1071,7 +1106,7 @@ fn collect_cpp_node(
                 defs,
             );
         }
-        "struct_specifier" => {
+        "struct_specifier" if c_tag_has_body(node) => {
             push_tree_sitter_def_with_name(
                 node,
                 source,
@@ -1080,7 +1115,7 @@ fn collect_cpp_node(
                 defs,
             );
         }
-        "enum_specifier" => {
+        "enum_specifier" if c_tag_has_body(node) => {
             push_tree_sitter_def_with_name(
                 node,
                 source,
@@ -1100,11 +1135,11 @@ fn collect_go_node(
     defs: &mut Vec<Definition>,
 ) {
     match node.kind() {
-        "import_declaration" => {
-            for module in quoted_modules_from_text(node_text(node, source)) {
+        "import_spec" => {
+            if let Some((module, name)) = go_import_from_text(node_text(node, source)) {
                 imports.push(Import {
                     module,
-                    name: None,
+                    name,
                     line: start_line_for_node(node),
                 });
             }
@@ -1113,7 +1148,9 @@ fn collect_go_node(
             push_tree_sitter_def(node, source, DefKind::Func, defs);
         }
         "type_spec" => {
-            let kind = if node_text(node, source).contains("interface") {
+            let kind = if has_named_descendant_kind(node, "function_type") {
+                DefKind::Func
+            } else if has_named_descendant_kind(node, "interface_type") {
                 DefKind::Trait
             } else {
                 DefKind::Struct
@@ -1202,12 +1239,23 @@ fn name_for_node(node: Node<'_>, source: &str) -> Option<String> {
     Some(node_text(name, source).trim().to_string()).filter(|name| !name.is_empty())
 }
 
-fn c_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
-    node.child_by_field_name("declarator")
-        .and_then(|declarator| {
-            first_descendant_text(declarator, source, &["identifier", "field_identifier"])
-        })
-        .or_else(|| first_descendant_text(node, source, &["identifier", "field_identifier"]))
+fn c_function_name(node: Node<'_>, source: &str) -> Option<String> {
+    let function = last_named_descendant_kind(node, "function_declarator")?;
+    let declarator = function
+        .child_by_field_name("declarator")
+        .unwrap_or(function);
+    last_descendant_text(
+        declarator,
+        source,
+        &[
+            "identifier",
+            "field_identifier",
+            "qualified_identifier",
+            "destructor_name",
+            "operator_name",
+        ],
+    )
+    .filter(|name| !looks_like_macro_name(name))
 }
 
 fn c_tag_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -1215,6 +1263,28 @@ fn c_tag_name(node: Node<'_>, source: &str) -> Option<String> {
         .map(|name| node_text(name, source).trim().to_string())
         .or_else(|| first_descendant_text(node, source, &["type_identifier"]))
         .filter(|name| !name.is_empty())
+}
+
+fn c_tag_has_body(node: Node<'_>) -> bool {
+    has_named_descendant_kind(node, "field_declaration_list")
+        || has_named_descendant_kind(node, "enumerator_list")
+}
+
+fn c_declaration_has_tag_body(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| c_tag_has_body(child))
+}
+
+fn cpp_class_name_from_declaration(text: &str) -> Option<String> {
+    let rest = text.split("class ").nth(1)?;
+    let name = rest
+        .trim_start()
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '{' | ':' | ';'))
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!name.is_empty() && !looks_like_macro_name(name)).then(|| name.to_string())
 }
 
 fn first_descendant_text(node: Node<'_>, source: &str, kinds: &[&str]) -> Option<String> {
@@ -1231,6 +1301,56 @@ fn first_descendant_text(node: Node<'_>, source: &str, kinds: &[&str]) -> Option
         }
     }
     None
+}
+
+fn last_descendant_text(node: Node<'_>, source: &str, kinds: &[&str]) -> Option<String> {
+    let mut found = None;
+    if kinds.contains(&node.kind()) {
+        let text = node_text(node, source).trim();
+        if !text.is_empty() {
+            found = Some(text.to_string());
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(text) = last_descendant_text(child, source, kinds) {
+            found = Some(text);
+        }
+    }
+    found
+}
+
+fn last_named_descendant_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut found = (node.kind() == kind).then_some(node);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(descendant) = last_named_descendant_kind(child, kind) {
+            found = Some(descendant);
+        }
+    }
+    found
+}
+
+fn has_named_descendant_kind(node: Node<'_>, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| has_named_descendant_kind(child, kind))
+}
+
+fn looks_like_macro_name(name: &str) -> bool {
+    let mut has_upper = false;
+    for ch in name.chars() {
+        if ch.is_ascii_lowercase() {
+            return false;
+        }
+        if ch.is_ascii_uppercase() {
+            has_upper = true;
+        }
+    }
+    has_upper
 }
 
 fn variable_declarator_is_callable(node: Node<'_>) -> bool {
@@ -1284,6 +1404,13 @@ fn c_include_from_text(text: &str) -> Option<String> {
         .and_then(|value| value.split_once('>'))
         .map(|(module, _)| module.trim().to_string())
         .filter(|module| !module.is_empty())
+}
+
+fn go_import_from_text(text: &str) -> Option<(String, Option<String>)> {
+    let module = quoted_module_from_text(text)?;
+    let prefix = text.split(['"', '`']).next().unwrap_or_default().trim();
+    let name = (!prefix.is_empty() && !matches!(prefix, "." | "_")).then(|| prefix.to_string());
+    Some((module, name))
 }
 
 fn quoted_module_from_text(text: &str) -> Option<String> {
