@@ -1342,6 +1342,70 @@ fn cli_index_project_accepts_embedding_flags_without_exposing_api_key() {
 }
 
 #[test]
+fn cli_help_prints_usage_successfully() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rustrank"))
+        .arg("--help")
+        .output()
+        .expect("run help");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage:"), "{stdout}");
+    assert!(stdout.contains("index-project"), "{stdout}");
+    assert!(stdout.contains("--list-tools"), "{stdout}");
+}
+
+#[test]
+fn cli_index_project_help_prints_usage_successfully() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rustrank"))
+        .args(["index-project", "--help"])
+        .output()
+        .expect("run index help");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage:"), "{stdout}");
+    assert!(stdout.contains("--repo-path <PATH>"), "{stdout}");
+    assert!(stdout.contains("--force-rebuild"), "{stdout}");
+    assert!(stdout.contains("--clean-stale"), "{stdout}");
+}
+
+#[test]
+fn cli_index_project_invalid_args_return_structured_json() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rustrank"))
+        .arg("index-project")
+        .output()
+        .expect("run invalid index cli");
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).expect("error json");
+    assert_eq!(error["error"], true);
+    assert_eq!(error["code"], "INVALID_ARGUMENTS");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--repo-path")),
+        "{error}"
+    );
+    assert!(
+        error["suggestion"]
+            .as_str()
+            .is_some_and(|suggestion| suggestion.contains("rustrank index-project")),
+        "{error}"
+    );
+}
+
+#[test]
 fn embedding_options_debug_redacts_api_key() {
     let options = embedding_options("http://127.0.0.1:9/v1", Some("secret-test-key"));
 

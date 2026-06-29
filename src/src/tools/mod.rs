@@ -10,6 +10,7 @@ use std::{future::Future, net::SocketAddr};
 
 use crate::embeddings::EmbeddingOptions;
 use axum::routing::get;
+use clap::{Parser, Subcommand, error::ErrorKind};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -31,6 +32,7 @@ const DEFAULT_HTTP_HOST: &str = "127.0.0.1";
 const DEFAULT_HTTP_PORT: &str = "63477";
 const DEFAULT_MCP_PATH: &str = "/mcp";
 const HEALTH_PATH: &str = "/healthz";
+const INDEX_PROJECT_USAGE: &str = "usage: rustrank index-project --repo-path <path> [--languages python,rust] [--force-rebuild] [--clean-stale] [--embeddings] [--embedding-base-url <url>] [--embedding-model <model>] [--embedding-dims <n>] [--embedding-api-key <key>]";
 
 pub const ALL_TOOLS: &[&str] = &[
     "index_project",
@@ -184,6 +186,81 @@ struct IndexProjectRequest {
     embedding_dims: Option<usize>,
     #[serde(default)]
     embedding_api_key: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "rustrank",
+    about = "RustRank MCP server and repository indexing CLI"
+)]
+struct Cli {
+    /// Print the registered MCP tool names and exit.
+    #[arg(long)]
+    list_tools: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Index a repository into RustRank's persistent cache.
+    IndexProject(IndexProjectCli),
+}
+
+#[derive(Debug, Parser)]
+struct IndexProjectCli {
+    /// Repository path to index.
+    #[arg(long, value_name = "PATH")]
+    repo_path: String,
+
+    /// Comma-separated language names to index.
+    #[arg(long, value_delimiter = ',', value_name = "LANGUAGES")]
+    languages: Vec<String>,
+
+    /// Rebuild all cache entries even when file hashes are unchanged.
+    #[arg(long)]
+    force_rebuild: bool,
+
+    /// Remove stale cache entries for files no longer present.
+    #[arg(long)]
+    clean_stale: bool,
+
+    /// Enable embedding generation for indexed symbols.
+    #[arg(long)]
+    embeddings: bool,
+
+    /// Embedding API base URL.
+    #[arg(long, value_name = "URL")]
+    embedding_base_url: Option<String>,
+
+    /// Embedding model name.
+    #[arg(long, value_name = "MODEL")]
+    embedding_model: Option<String>,
+
+    /// Embedding vector dimensionality.
+    #[arg(long, value_name = "N")]
+    embedding_dims: Option<usize>,
+
+    /// Embedding API key.
+    #[arg(long, value_name = "KEY")]
+    embedding_api_key: Option<String>,
+}
+
+impl From<IndexProjectCli> for IndexProjectRequest {
+    fn from(cli: IndexProjectCli) -> Self {
+        Self {
+            repo_path: cli.repo_path,
+            languages: (!cli.languages.is_empty()).then_some(cli.languages),
+            force_rebuild: cli.force_rebuild,
+            clean_stale: cli.clean_stale,
+            embeddings: cli.embeddings.then_some(true),
+            embedding_base_url: cli.embedding_base_url,
+            embedding_model: cli.embedding_model,
+            embedding_dims: cli.embedding_dims,
+            embedding_api_key: cli.embedding_api_key,
+        }
+    }
 }
 
 impl std::fmt::Debug for IndexProjectRequest {
@@ -463,13 +540,38 @@ impl ServerHandler for RustRankRouter {
 }
 
 pub fn serve() -> anyhow::Result<()> {
-    if std::env::args().any(|arg| arg == "--list-tools") {
-        println!("{}", ALL_TOOLS.join("\n"));
-        return Ok(());
-    }
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.len() > 1 {
+        let is_index_project = args.get(1).is_some_and(|arg| arg == "index-project");
+        let cli = match Cli::try_parse_from(args) {
+            Ok(cli) => cli,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
+            {
+                err.print()?;
+                return Ok(());
+            }
+            Err(err) if is_index_project => {
+                print_index_project_invalid_arguments(err.to_string());
+                std::process::exit(2);
+            }
+            Err(err) => {
+                err.print()?;
+                std::process::exit(2);
+            }
+        };
 
-    if std::env::args().nth(1).as_deref() == Some("index-project") {
-        return run_index_project_cli();
+        if cli.list_tools {
+            println!("{}", ALL_TOOLS.join("\n"));
+            return Ok(());
+        }
+
+        if let Some(Commands::IndexProject(req)) = cli.command {
+            return run_index_project_cli(req.into());
+        }
     }
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -481,118 +583,36 @@ pub fn serve() -> anyhow::Result<()> {
     })
 }
 
-fn run_index_project_cli() -> anyhow::Result<()> {
-    match parse_index_project_cli(std::env::args().skip(2).collect()) {
-        Ok(req) => {
-            let repo_path = req.repo_path.clone();
-            let response = crate::index::index_project_with_embeddings(
-                &req.repo_path,
-                req.languages,
-                req.force_rebuild,
-                req.clean_stale,
-                EmbeddingOptions {
-                    enabled: req.embeddings,
-                    base_url: req.embedding_base_url,
-                    model: req.embedding_model,
-                    dimensions: req.embedding_dims,
-                    api_key: req.embedding_api_key,
-                },
-            )?;
-            agent::set_current_repo(repo_path)?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
-            Ok(())
-        }
-        Err(message) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "error": true,
-                    "code": "INVALID_ARGUMENTS",
-                    "message": message,
-                    "suggestion": "usage: rustrank index-project --repo-path <path> [--languages python,rust] [--force-rebuild] [--clean-stale] [--embeddings] [--embedding-base-url <url>] [--embedding-model <model>] [--embedding-dims <n>] [--embedding-api-key <key>]"
-                })
-            );
-            std::process::exit(2);
-        }
-    }
+fn run_index_project_cli(req: IndexProjectRequest) -> anyhow::Result<()> {
+    let repo_path = req.repo_path.clone();
+    let response = crate::index::index_project_with_embeddings(
+        &req.repo_path,
+        req.languages,
+        req.force_rebuild,
+        req.clean_stale,
+        EmbeddingOptions {
+            enabled: req.embeddings,
+            base_url: req.embedding_base_url,
+            model: req.embedding_model,
+            dimensions: req.embedding_dims,
+            api_key: req.embedding_api_key,
+        },
+    )?;
+    agent::set_current_repo(repo_path)?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
 }
 
-fn parse_index_project_cli(args: Vec<String>) -> std::result::Result<IndexProjectRequest, String> {
-    let mut repo_path = None;
-    let mut languages = None;
-    let mut force_rebuild = false;
-    let mut clean_stale = false;
-    let mut embeddings = None;
-    let mut embedding_base_url = None;
-    let mut embedding_model = None;
-    let mut embedding_dims = None;
-    let mut embedding_api_key = None;
-    let mut iter = args.into_iter();
-
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--repo-path" => {
-                repo_path = Some(
-                    iter.next()
-                        .ok_or_else(|| "--repo-path requires a value".to_string())?,
-                );
-            }
-            "--languages" => {
-                let raw = iter
-                    .next()
-                    .ok_or_else(|| "--languages requires a comma-separated value".to_string())?;
-                languages = Some(
-                    raw.split(',')
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect(),
-                );
-            }
-            "--force-rebuild" => force_rebuild = true,
-            "--clean-stale" => clean_stale = true,
-            "--embeddings" => embeddings = Some(true),
-            "--embedding-base-url" => {
-                embedding_base_url = Some(
-                    iter.next()
-                        .ok_or_else(|| "--embedding-base-url requires a value".to_string())?,
-                );
-            }
-            "--embedding-model" => {
-                embedding_model = Some(
-                    iter.next()
-                        .ok_or_else(|| "--embedding-model requires a value".to_string())?,
-                );
-            }
-            "--embedding-dims" => {
-                embedding_dims = Some(
-                    iter.next()
-                        .ok_or_else(|| "--embedding-dims requires a value".to_string())?
-                        .parse()
-                        .map_err(|err| format!("invalid --embedding-dims: {err}"))?,
-                );
-            }
-            "--embedding-api-key" => {
-                embedding_api_key = Some(
-                    iter.next()
-                        .ok_or_else(|| "--embedding-api-key requires a value".to_string())?,
-                );
-            }
-            other => return Err(format!("unknown argument {other:?}")),
-        }
-    }
-
-    Ok(IndexProjectRequest {
-        repo_path: repo_path.ok_or_else(|| "--repo-path is required".to_string())?,
-        languages,
-        force_rebuild,
-        clean_stale,
-        embeddings,
-        embedding_base_url,
-        embedding_model,
-        embedding_dims,
-        embedding_api_key,
-    })
+fn print_index_project_invalid_arguments(message: String) {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "error": true,
+            "code": "INVALID_ARGUMENTS",
+            "message": message,
+            "suggestion": INDEX_PROJECT_USAGE
+        })
+    );
 }
 
 fn default_impact_depth() -> usize {
