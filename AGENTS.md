@@ -19,7 +19,7 @@ Language index shards:
 | Language | Files | Symbols | Imports |
 | --- | ---: | ---: | ---: |
 | python | 1 | 20 | 12 |
-| rust | 19 | 406 | 72 |
+| rust | 19 | 425 | 73 |
 
 The cache stores per-file symbols, imports, declared namespaces, content hashes, graph nodes, graph edges, and git freshness metadata. It does not store source lines, snippets, or absolute paths. Re-run `index_project` after source changes to refresh this section and the persistent cache.
 <!-- rustrank-index:end -->
