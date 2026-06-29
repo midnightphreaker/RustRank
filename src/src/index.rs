@@ -247,7 +247,7 @@ pub fn index_project_with_embeddings(
                 .transpose()?
                 .flatten();
 
-            let fact = if let Some(fact) = maybe_cached {
+            let fact = if let Some(fact) = maybe_cached.filter(|fact| fact.language == language) {
                 hits += 1;
                 fact
             } else {
@@ -314,6 +314,12 @@ pub fn index_project_with_embeddings(
             .invalid
             .into_iter()
             .map(|name| format!("ignored unsupported configured language {name:?}")),
+    );
+    warnings.extend(
+        project_config::configured_language_overrides(root)?
+            .invalid
+            .into_iter()
+            .map(|name| format!("ignored unsupported language override {name:?}")),
     );
     warnings.sort();
     warnings.dedup();

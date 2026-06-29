@@ -67,6 +67,26 @@ fn language_from_path_recognizes_all_supported_extensions() {
         Language::from_path(std::path::Path::new("web/legacy.cjs")),
         Some(Language::JavaScript)
     );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("native/auth.c")),
+        Some(Language::C)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("native/auth.h")),
+        Some(Language::C)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("native/session.cpp")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("native/session.hpp")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        Language::from_path(std::path::Path::new("goapp/auth.go")),
+        Some(Language::Go)
+    );
     assert_eq!(Language::from_path(std::path::Path::new("README.md")), None);
     assert_eq!(
         Language::from_path(std::path::Path::new("package.json")),
@@ -158,6 +178,13 @@ fn context_parse_all_extracts_supported_languages() {
             .iter()
             .any(|module| module.language == Language::JavaScript)
     );
+    assert!(modules.iter().any(|module| module.language == Language::C));
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.language == Language::Cpp)
+    );
+    assert!(modules.iter().any(|module| module.language == Language::Go));
 
     let rust = modules
         .iter()
@@ -205,6 +232,32 @@ fn context_parse_all_extracts_supported_languages() {
             .any(|import| import.module == "./format")
     );
     assert!(javascript.defs.iter().any(|def| def.name == "loginBrowser"));
+
+    let c = modules
+        .iter()
+        .find(|module| module.path.ends_with("native/auth.c"))
+        .expect("c module");
+    assert!(c.imports.iter().any(|import| import.module == "auth.h"));
+    assert!(c.defs.iter().any(|def| def.name == "native_login"));
+
+    let cpp = modules
+        .iter()
+        .find(|module| module.path.ends_with("native/session.cpp"))
+        .expect("cpp module");
+    assert!(
+        cpp.imports
+            .iter()
+            .any(|import| import.module == "session.hpp")
+    );
+    assert!(cpp.defs.iter().any(|def| def.name == "format_user"));
+
+    let go = modules
+        .iter()
+        .find(|module| module.path.ends_with("goapp/auth.go"))
+        .expect("go module");
+    assert!(go.imports.iter().any(|import| import.module == "fmt"));
+    assert!(go.defs.iter().any(|def| def.name == "GoUser"));
+    assert!(go.defs.iter().any(|def| def.name == "LoginUser"));
 }
 
 #[test]
@@ -255,6 +308,233 @@ fn supported_source_files_honors_default_and_configured_excludes() {
     assert!(!paths.iter().any(|path| path.contains(".venv")));
     assert!(!paths.iter().any(|path| path.contains("generated")));
     assert!(paths.iter().any(|path| path == "pkg/core.py"));
+}
+
+#[test]
+fn h_headers_default_to_c_without_language_override() {
+    let fixture = fixture();
+
+    let files = supported_source_files(fixture.path()).expect("source files");
+    let header = files
+        .iter()
+        .find(|(path, _)| path.ends_with("native/auth.h"))
+        .expect("c header");
+    let ctx = Context::new(fixture.path().to_path_buf());
+    let parsed = ctx
+        .get_or_parse("native/auth.h".to_string())
+        .expect("parse header");
+
+    assert_eq!(header.1, Language::C);
+    assert_eq!(parsed.language, Language::C);
+}
+
+#[test]
+fn language_overrides_classify_matching_h_headers_as_cpp() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.path().join("include/cpp")).expect("include dir");
+    std::fs::write(
+        fixture.path().join("include/cpp/widget.h"),
+        r#"
+#pragma once
+
+class Widget {
+public:
+    int id() const;
+};
+"#,
+    )
+    .expect("cpp header");
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"languages":{"overrides":[{"paths":["include/cpp/**/*.h"],"language":"cpp"}]}}"#,
+    )
+    .expect("config");
+
+    let files = supported_source_files(fixture.path()).expect("source files");
+    let overridden = files
+        .iter()
+        .find(|(path, _)| path.ends_with("include/cpp/widget.h"))
+        .expect("overridden header");
+    let ordinary = files
+        .iter()
+        .find(|(path, _)| path.ends_with("native/auth.h"))
+        .expect("ordinary header");
+
+    assert_eq!(overridden.1, Language::Cpp);
+    assert_eq!(ordinary.1, Language::C);
+}
+
+#[test]
+fn language_overrides_keep_direct_and_bulk_parsing_consistent() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.path().join("include/cpp")).expect("include dir");
+    std::fs::write(
+        fixture.path().join("include/cpp/widget.h"),
+        r#"
+#pragma once
+
+class Widget {
+public:
+    int id() const;
+};
+"#,
+    )
+    .expect("cpp header");
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"languages":{"overrides":[{"paths":["include/cpp/**/*.h"],"language":"cpp"}]}}"#,
+    )
+    .expect("config");
+
+    let ctx = Context::new(fixture.path().to_path_buf());
+    let direct = ctx
+        .get_or_parse("include/cpp/widget.h".to_string())
+        .expect("direct parse");
+    let bulk = ctx
+        .parse_all()
+        .expect("bulk parse")
+        .into_iter()
+        .find(|module| module.path.ends_with("include/cpp/widget.h"))
+        .expect("bulk module");
+
+    assert_eq!(direct.language, Language::Cpp);
+    assert_eq!(bulk.language, Language::Cpp);
+}
+
+#[test]
+fn index_project_writes_overridden_h_headers_to_cpp_shard() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.path().join("include/cpp")).expect("include dir");
+    std::fs::write(
+        fixture.path().join("include/cpp/widget.h"),
+        r#"
+#pragma once
+
+class Widget {
+public:
+    int id() const;
+};
+"#,
+    )
+    .expect("cpp header");
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"languages":{"enabled":["c","cpp"],"overrides":[{"paths":["include/cpp/**/*.h"],"language":"cpp"}]}}"#,
+    )
+    .expect("config");
+
+    let summary =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+    let cpp_summary = summary
+        .languages
+        .iter()
+        .find(|language| language.language == Language::Cpp)
+        .expect("cpp summary");
+    let c_summary = summary
+        .languages
+        .iter()
+        .find(|language| language.language == Language::C)
+        .expect("c summary");
+    let cpp_index: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.path().join(&cpp_summary.index_file)).expect("cpp index"),
+    )
+    .expect("cpp index json");
+    let c_index: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.path().join(&c_summary.index_file)).expect("c index"),
+    )
+    .expect("c index json");
+
+    assert!(
+        cpp_index["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "include/cpp/widget.h"),
+        "{cpp_index}"
+    );
+    assert!(
+        !c_index["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "include/cpp/widget.h"),
+        "{c_index}"
+    );
+}
+
+#[test]
+fn index_project_warns_for_invalid_language_override_name() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"languages":{"overrides":[{"paths":["native/**/*.h"],"language":"objective-c"}]}}"#,
+    )
+    .expect("config");
+
+    let summary =
+        index_project(fixture.path().to_str().unwrap(), None, true, true).expect("index project");
+
+    assert!(
+        summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ignored unsupported language override")),
+        "{:?}",
+        summary.warnings
+    );
+}
+
+#[test]
+fn language_override_invalid_glob_returns_validation_error() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"languages":{"overrides":[{"paths":["include/**/[broken"],"language":"cpp"}]}}"#,
+    )
+    .expect("config");
+
+    let err = supported_source_files(fixture.path()).expect_err("invalid glob");
+
+    assert!(err.to_string().contains("error parsing glob"), "{err}");
+}
+
+#[test]
+fn language_overrides_respect_enabled_language_filtering() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.path().join("include/cpp")).expect("include dir");
+    std::fs::write(
+        fixture.path().join("include/cpp/widget.h"),
+        r#"
+#pragma once
+
+class Widget {
+public:
+    int id() const;
+};
+"#,
+    )
+    .expect("cpp header");
+    std::fs::write(
+        fixture.path().join(".rustrank_config.json"),
+        r#"{"languages":{"enabled":["c"],"overrides":[{"paths":["include/cpp/**/*.h"],"language":"cpp"}]}}"#,
+    )
+    .expect("config");
+
+    let modules = Context::new(fixture.path().to_path_buf())
+        .parse_all()
+        .expect("parse filtered");
+
+    assert!(
+        modules
+            .iter()
+            .any(|module| module.path.ends_with("native/auth.h") && module.language == Language::C)
+    );
+    assert!(
+        !modules
+            .iter()
+            .any(|module| module.path.ends_with("include/cpp/widget.h")),
+        "{modules:?}"
+    );
 }
 
 #[test]
@@ -477,6 +757,11 @@ fn enabled_language_config_filters_parse_and_tools() {
             .iter()
             .any(|module| matches!(module.language, Language::TypeScript | Language::JavaScript))
     );
+    assert!(
+        !modules
+            .iter()
+            .any(|module| matches!(module.language, Language::C | Language::Cpp | Language::Go))
+    );
 
     let rank_rows =
         coderank_analysis(fixture.path().to_str().unwrap(), 50, None, false).expect("rank");
@@ -511,7 +796,26 @@ fn index_project_generates_language_shards_and_project_manifest() {
         serde_json::from_str(&std::fs::read_to_string(manifest_path).expect("manifest"))
             .expect("manifest json");
     assert_eq!(manifest["header"]["schema_version"], 1);
-    assert!(manifest["languages"].as_array().unwrap().len() >= 5);
+    assert!(manifest["languages"].as_array().unwrap().len() >= 8);
+    for language in ["c", "cpp", "go"] {
+        assert!(
+            summary
+                .languages
+                .iter()
+                .any(|row| row.language.config_name() == language && row.files > 0),
+            "{:?}",
+            summary.languages
+        );
+        assert!(
+            manifest["languages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["language"] == language),
+            "{:?}",
+            manifest["languages"]
+        );
+    }
     assert_eq!(
         manifest["nodes"].as_array().unwrap()[0]["schema"],
         "graph_node"

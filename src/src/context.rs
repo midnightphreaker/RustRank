@@ -36,20 +36,41 @@ pub enum Language {
     CSharp,
     TypeScript,
     JavaScript,
+    C,
+    #[serde(rename = "cpp")]
+    Cpp,
+    Go,
 }
 
 impl Language {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::Python,
         Self::Rust,
         Self::CSharp,
         Self::TypeScript,
         Self::JavaScript,
+        Self::C,
+        Self::Cpp,
+        Self::Go,
     ];
 
     pub fn from_path(path: &Path) -> Option<Self> {
         let path = path.to_string_lossy().to_ascii_lowercase();
-        if path.ends_with(".tsx") || path.ends_with(".ts") {
+        if path.ends_with(".h++")
+            || path.ends_with(".hh")
+            || path.ends_with(".hpp")
+            || path.ends_with(".hxx")
+            || path.ends_with(".c++")
+            || path.ends_with(".cc")
+            || path.ends_with(".cpp")
+            || path.ends_with(".cxx")
+        {
+            Some(Self::Cpp)
+        } else if path.ends_with(".h") || path.ends_with(".c") {
+            Some(Self::C)
+        } else if path.ends_with(".go") {
+            Some(Self::Go)
+        } else if path.ends_with(".tsx") || path.ends_with(".ts") {
             Some(Self::TypeScript)
         } else if path.ends_with(".jsx")
             || path.ends_with(".mjs")
@@ -75,6 +96,9 @@ impl Language {
             Self::CSharp => "csharp",
             Self::TypeScript => "typescript",
             Self::JavaScript => "javascript",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Go => "go",
         }
     }
 
@@ -85,6 +109,9 @@ impl Language {
             "csharp" | "c#" | "cs" => Some(Self::CSharp),
             "typescript" | "ts" | "tsx" => Some(Self::TypeScript),
             "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "c" => Some(Self::C),
+            "cpp" | "c++" | "cc" | "cxx" | "h++" | "hh" | "hpp" | "hxx" => Some(Self::Cpp),
+            "go" | "golang" => Some(Self::Go),
             _ => None,
         }
     }
@@ -96,6 +123,9 @@ impl Language {
             Self::CSharp => 2,
             Self::TypeScript => 3,
             Self::JavaScript => 4,
+            Self::C => 5,
+            Self::Cpp => 6,
+            Self::Go => 7,
         }
     }
 }
@@ -179,16 +209,21 @@ impl Context {
         }
 
         let full_path = self.path.join(&rel_path);
-        let language = Language::from_path(&full_path).ok_or_else(|| {
-            AppError::Validation(format!("unsupported source file: {}", full_path.display()))
-        })?;
+        let language =
+            project_config::resolve_language(&self.path, &full_path)?.ok_or_else(|| {
+                AppError::Validation(format!("unsupported source file: {}", full_path.display()))
+            })?;
         let source = std::fs::read_to_string(&full_path)?;
         let source_lines = source.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
         let (imports, defs) = match language {
             Language::Python => parse_python_module(&full_path, &source)?,
-            Language::Rust | Language::CSharp | Language::TypeScript | Language::JavaScript => {
-                parse_tree_sitter_module(language, &full_path, &source)?
-            }
+            Language::Rust
+            | Language::CSharp
+            | Language::TypeScript
+            | Language::JavaScript
+            | Language::C
+            | Language::Cpp
+            | Language::Go => parse_tree_sitter_module(language, &full_path, &source)?,
         };
         let module = ModuleDef {
             path: PathBuf::from(&rel_path),
@@ -233,7 +268,7 @@ pub fn all_supported_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)
         if excludes.is_excluded(root, path) {
             continue;
         }
-        if let Some(language) = Language::from_path(path) {
+        if let Some(language) = project_config::resolve_language(root, path)? {
             files.push((path.to_path_buf(), language));
         }
     }
@@ -359,6 +394,7 @@ impl LocalModuleResolver {
             Language::Python => self.resolve_python_import(source, import),
             Language::Rust => self.resolve_rust_import(source, import),
             Language::CSharp => self.resolve_by_candidate(&import.module),
+            Language::C | Language::Cpp | Language::Go => self.resolve_by_candidate(&import.module),
             Language::TypeScript | Language::JavaScript => {
                 self.resolve_js_ts_import(source, import)
             }
@@ -834,6 +870,9 @@ fn tree_sitter_language(language: Language, path: &Path) -> Option<tree_sitter::
         Language::Python => Some(tree_sitter_python::LANGUAGE.into()),
         Language::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
         Language::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        Language::C => Some(tree_sitter_c::LANGUAGE.into()),
+        Language::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+        Language::Go => Some(tree_sitter_go::LANGUAGE.into()),
         Language::TypeScript
             if path
                 .extension()
@@ -857,6 +896,9 @@ fn collect_tree_sitter(
         Language::Python => collect_python_node(node, source, imports, defs),
         Language::Rust => collect_rust_node(node, source, imports, defs),
         Language::CSharp => collect_csharp_node(node, source, imports, defs),
+        Language::C => collect_c_node(node, source, imports, defs),
+        Language::Cpp => collect_cpp_node(node, source, imports, defs),
+        Language::Go => collect_go_node(node, source, imports, defs),
         Language::TypeScript | Language::JavaScript => {
             collect_js_ts_node(node, language, source, imports, defs);
         }
@@ -948,6 +990,140 @@ fn collect_csharp_node(
     }
 }
 
+fn collect_c_node(
+    node: Node<'_>,
+    source: &str,
+    imports: &mut Vec<Import>,
+    defs: &mut Vec<Definition>,
+) {
+    match node.kind() {
+        "preproc_include" => {
+            if let Some(module) = c_include_from_text(node_text(node, source)) {
+                imports.push(Import {
+                    module,
+                    name: None,
+                    line: start_line_for_node(node),
+                });
+            }
+        }
+        "function_definition" => {
+            push_tree_sitter_def_with_name(
+                node,
+                source,
+                DefKind::Func,
+                c_declarator_name(node, source),
+                defs,
+            );
+        }
+        "struct_specifier" => {
+            push_tree_sitter_def_with_name(
+                node,
+                source,
+                DefKind::Struct,
+                c_tag_name(node, source),
+                defs,
+            );
+        }
+        "enum_specifier" => {
+            push_tree_sitter_def_with_name(
+                node,
+                source,
+                DefKind::Enum,
+                c_tag_name(node, source),
+                defs,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn collect_cpp_node(
+    node: Node<'_>,
+    source: &str,
+    imports: &mut Vec<Import>,
+    defs: &mut Vec<Definition>,
+) {
+    match node.kind() {
+        "preproc_include" => {
+            if let Some(module) = c_include_from_text(node_text(node, source)) {
+                imports.push(Import {
+                    module,
+                    name: None,
+                    line: start_line_for_node(node),
+                });
+            }
+        }
+        "function_definition" => {
+            push_tree_sitter_def_with_name(
+                node,
+                source,
+                DefKind::Func,
+                c_declarator_name(node, source),
+                defs,
+            );
+        }
+        "class_specifier" => {
+            push_tree_sitter_def_with_name(
+                node,
+                source,
+                DefKind::Class,
+                c_tag_name(node, source),
+                defs,
+            );
+        }
+        "struct_specifier" => {
+            push_tree_sitter_def_with_name(
+                node,
+                source,
+                DefKind::Struct,
+                c_tag_name(node, source),
+                defs,
+            );
+        }
+        "enum_specifier" => {
+            push_tree_sitter_def_with_name(
+                node,
+                source,
+                DefKind::Enum,
+                c_tag_name(node, source),
+                defs,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn collect_go_node(
+    node: Node<'_>,
+    source: &str,
+    imports: &mut Vec<Import>,
+    defs: &mut Vec<Definition>,
+) {
+    match node.kind() {
+        "import_declaration" => {
+            for module in quoted_modules_from_text(node_text(node, source)) {
+                imports.push(Import {
+                    module,
+                    name: None,
+                    line: start_line_for_node(node),
+                });
+            }
+        }
+        "function_declaration" | "method_declaration" => {
+            push_tree_sitter_def(node, source, DefKind::Func, defs);
+        }
+        "type_spec" => {
+            let kind = if node_text(node, source).contains("interface") {
+                DefKind::Trait
+            } else {
+                DefKind::Struct
+            };
+            push_tree_sitter_def(node, source, kind, defs);
+        }
+        _ => {}
+    }
+}
+
 fn collect_js_ts_node(
     node: Node<'_>,
     language: Language,
@@ -999,6 +1175,19 @@ fn push_tree_sitter_def(node: Node<'_>, source: &str, kind: DefKind, defs: &mut 
     let Some(name) = name_for_node(node, source) else {
         return;
     };
+    push_tree_sitter_def_with_name(node, source, kind, Some(name), defs);
+}
+
+fn push_tree_sitter_def_with_name(
+    node: Node<'_>,
+    source: &str,
+    kind: DefKind,
+    name: Option<String>,
+    defs: &mut Vec<Definition>,
+) {
+    let Some(name) = name.filter(|name| !name.is_empty()) else {
+        return;
+    };
     defs.push(Definition {
         name,
         kind,
@@ -1011,6 +1200,37 @@ fn push_tree_sitter_def(node: Node<'_>, source: &str, kind: DefKind, defs: &mut 
 fn name_for_node(node: Node<'_>, source: &str) -> Option<String> {
     let name = node.child_by_field_name("name")?;
     Some(node_text(name, source).trim().to_string()).filter(|name| !name.is_empty())
+}
+
+fn c_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("declarator")
+        .and_then(|declarator| {
+            first_descendant_text(declarator, source, &["identifier", "field_identifier"])
+        })
+        .or_else(|| first_descendant_text(node, source, &["identifier", "field_identifier"]))
+}
+
+fn c_tag_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .map(|name| node_text(name, source).trim().to_string())
+        .or_else(|| first_descendant_text(node, source, &["type_identifier"]))
+        .filter(|name| !name.is_empty())
+}
+
+fn first_descendant_text(node: Node<'_>, source: &str, kinds: &[&str]) -> Option<String> {
+    if kinds.contains(&node.kind()) {
+        let text = node_text(node, source).trim();
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(text) = first_descendant_text(child, source, kinds) {
+            return Some(text);
+        }
+    }
+    None
 }
 
 fn variable_declarator_is_callable(node: Node<'_>) -> bool {
@@ -1054,9 +1274,26 @@ fn csharp_import_from_text(text: &str) -> Option<String> {
     (!module.is_empty()).then(|| module.to_string())
 }
 
+fn c_include_from_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    let rest = text.strip_prefix("#include")?.trim();
+    if let Some(module) = quoted_module_from_text(rest) {
+        return Some(module);
+    }
+    rest.strip_prefix('<')
+        .and_then(|value| value.split_once('>'))
+        .map(|(module, _)| module.trim().to_string())
+        .filter(|module| !module.is_empty())
+}
+
 fn quoted_module_from_text(text: &str) -> Option<String> {
+    quoted_modules_from_text(text).into_iter().next()
+}
+
+fn quoted_modules_from_text(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut idx = 0;
+    let mut modules = Vec::new();
     while idx < bytes.len() {
         let quote = bytes[idx];
         if matches!(quote, b'\'' | b'"' | b'`') {
@@ -1068,15 +1305,16 @@ fn quoted_module_from_text(text: &str) -> Option<String> {
                     continue;
                 }
                 if bytes[end] == quote {
-                    return Some(text[start..end].to_string());
+                    modules.push(text[start..end].to_string());
+                    idx = end;
+                    break;
                 }
                 end += 1;
             }
-            return None;
         }
         idx += 1;
     }
-    None
+    modules
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

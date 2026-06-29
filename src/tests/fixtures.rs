@@ -219,5 +219,78 @@ export function browserLogin(userId) {
 "#,
     )
     .expect("mjs browser");
+    fs::create_dir_all(root.join("native")).expect("native dir");
+    fs::write(
+        root.join("native/auth.h"),
+        r#"
+#pragma once
+
+typedef struct NativeUser {
+    const char *user_id;
+} NativeUser;
+
+NativeUser native_login(const char *user_id);
+"#,
+    )
+    .expect("c header");
+    fs::write(
+        root.join("native/auth.c"),
+        r#"
+#include "auth.h"
+#include <string.h>
+
+NativeUser native_login(const char *user_id) {
+    NativeUser user = { user_id };
+    return user;
+}
+"#,
+    )
+    .expect("c source");
+    fs::write(
+        root.join("native/session.hpp"),
+        r#"
+#pragma once
+
+class Session {
+public:
+    bool active() const;
+};
+"#,
+    )
+    .expect("cpp header");
+    fs::write(
+        root.join("native/session.cpp"),
+        r#"
+#include "session.hpp"
+#include <string>
+
+bool Session::active() const {
+    return true;
+}
+
+std::string format_user(const std::string& user_id) {
+    return user_id;
+}
+"#,
+    )
+    .expect("cpp source");
+    fs::create_dir_all(root.join("goapp")).expect("go dir");
+    fs::write(
+        root.join("goapp/auth.go"),
+        r#"
+package goapp
+
+import "fmt"
+
+type GoUser struct {
+    ID string
+}
+
+func LoginUser(userID string) GoUser {
+    return GoUser{ID: fmt.Sprintf("%s", userID)}
+}
+"#,
+    )
+    .expect("go source");
     dir
 }

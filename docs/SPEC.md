@@ -17,9 +17,16 @@ extensions:
 | C# | `.cs` |
 | TypeScript | `.ts`, `.tsx` |
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| C | `.c`, `.h` |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++` |
+| Go | `.go` |
 
 Ignored directories include `.git`, `.rustrank`, `target`, `node_modules`,
 `dist`, `build`, `.venv`, `venv`, `__pycache__`, and `.pytest_cache`.
+
+`.h` headers are classified as C by default. C-family headers are often
+ambiguous, especially when they contain shared declarations or small portable
+interfaces. Repositories that use `.h` for C++ should configure path overrides.
 
 ## Project Configuration
 
@@ -43,6 +50,33 @@ The typed language configuration lives under the top-level `languages` key:
 If `languages.enabled` is missing or empty, RustRank auto-detects languages
 from current source files. Unknown language names are ignored and reported as
 warnings by indexing.
+
+Language overrides are ordered path rules under `languages.overrides`:
+
+```json
+{
+  "languages": {
+    "enabled": ["c", "cpp"],
+    "overrides": [
+      {
+        "paths": ["include/cpp/**/*.h", "src/cxx/**/*.h"],
+        "language": "cpp"
+      }
+    ]
+  }
+}
+```
+
+Resolution order is:
+
+1. `excludes.paths` and `excludes.extensions`.
+2. First matching `languages.overrides` rule.
+3. Built-in extension mapping.
+
+Override languages use the same aliases as `languages.enabled`. Unsupported
+override language names are ignored and reported as indexing warnings. Invalid
+override globs fail with a validation error. `languages.enabled` filtering is
+applied after overrides.
 
 Source excludes can be extended with `excludes.paths` globs and
 `excludes.extensions` values:

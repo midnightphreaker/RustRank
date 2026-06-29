@@ -18,6 +18,18 @@ pub struct ConfiguredLanguages {
     pub auto_detected: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredLanguageOverrides {
+    rules: Vec<LanguageOverride>,
+    pub invalid: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LanguageOverride {
+    paths: Vec<String>,
+    language: Language,
+}
+
 pub struct ConfiguredExcludes {
     path_globs: GlobSet,
     extensions: HashSet<String>,
@@ -83,6 +95,79 @@ pub fn configured_languages(repo_path: &Path) -> Result<ConfiguredLanguages> {
 
 pub fn enabled_languages(repo_path: &Path) -> Result<Vec<Language>> {
     Ok(configured_languages(repo_path)?.enabled)
+}
+
+pub fn configured_language_overrides(repo_path: &Path) -> Result<ConfiguredLanguageOverrides> {
+    let raw = get_raw_config(repo_path)?;
+    let Some(values) = raw
+        .get("languages")
+        .and_then(|languages| languages.get("overrides"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(ConfiguredLanguageOverrides {
+            rules: Vec::new(),
+            invalid: Vec::new(),
+        });
+    };
+
+    let mut rules = Vec::new();
+    let mut invalid = Vec::new();
+    for value in values {
+        let Some(rule) = value.as_object() else {
+            invalid.push(value.to_string());
+            continue;
+        };
+        let paths = rule
+            .get("paths")
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(raw_language) = rule.get("language").and_then(Value::as_str) else {
+            invalid.push(value.to_string());
+            continue;
+        };
+        let Some(language) = Language::from_config_name(raw_language) else {
+            invalid.push(raw_language.to_string());
+            continue;
+        };
+
+        validate_globs(&paths)?;
+        if paths.is_empty() {
+            invalid.push(value.to_string());
+            continue;
+        }
+        rules.push(LanguageOverride { paths, language });
+    }
+
+    Ok(ConfiguredLanguageOverrides { rules, invalid })
+}
+
+pub fn resolve_language(root: &Path, path: &Path) -> Result<Option<Language>> {
+    if configured_excludes(root)?.is_excluded(root, path) {
+        return Ok(None);
+    }
+
+    let rel = relative_path(root, path);
+    for rule in configured_language_overrides(root)?.rules {
+        for pattern in rule.paths {
+            let glob = GlobBuilder::new(&pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|err| crate::error::AppError::Validation(err.to_string()))?
+                .compile_matcher();
+            if glob.is_match(&rel) {
+                return Ok(Some(rule.language));
+            }
+        }
+    }
+
+    Ok(Language::from_path(path))
 }
 
 pub fn configured_excludes(repo_path: &Path) -> Result<ConfiguredExcludes> {
@@ -174,6 +259,23 @@ fn auto_detected_languages(repo_path: &Path) -> Result<ConfiguredLanguages> {
         invalid: Vec::new(),
         auto_detected: true,
     })
+}
+
+fn validate_globs(patterns: &[String]) -> Result<()> {
+    for pattern in patterns {
+        GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|err| crate::error::AppError::Validation(err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn set_nested_value(config: &mut Map<String, Value>, key: &str, value: Value) {

@@ -116,7 +116,7 @@ Read the current config:
 
 ## Supported languages
 
-RustRank supports five language families. The canonical names are the values to
+RustRank supports eight language families. The canonical names are the values to
 use in `.rustrank_config.json`, `set_config`, and `index_project.languages`.
 
 | Language | Canonical config name | Extensions | Accepted aliases | Extracted facts |
@@ -126,6 +126,9 @@ use in `.rustrank_config.json`, `set_config`, and `index_project.languages`.
 | C# | `csharp` | `.cs` | `c#`, `cs` | `using` imports, classes, records, structs, interfaces, enums, methods, constructors, and declared namespaces. |
 | TypeScript | `typescript` | `.ts`, `.tsx` | `ts`, `tsx` | ES imports and exports, `require` calls, functions, classes, interfaces, enums, methods, and callable variable declarations. |
 | JavaScript | `javascript` | `.js`, `.jsx`, `.mjs`, `.cjs` | `js`, `jsx`, `mjs`, `cjs` | ES imports and exports, `require` calls, functions, classes, methods, and callable variable declarations. |
+| C | `c` | `.c`, `.h` | `c` | `#include` imports, functions, structs, and enums. |
+| C++ | `cpp` | `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++` | `c++`, `cc`, `cxx`, `hpp`, `hh`, `hxx` | `#include` imports, functions, classes, structs, and enums. |
+| Go | `go` | `.go` | `golang` | Imports, functions, methods, structs, and interfaces. |
 
 RustRank skips source files under these ignored directories when building the
 language-aware source set:
@@ -163,6 +166,32 @@ The language config shape is:
 
 `set_config` writes one top-level key at a time, so set language config with
 `key = "languages"` and a value containing `enabled`.
+
+`.h` headers are classified as C by default because C-family headers can be
+valid C, C++, Objective-C, or shared declarations. Use ordered path overrides
+when a repository stores C++ headers with a `.h` extension:
+
+```json
+{
+  "languages": {
+    "enabled": ["c", "cpp"],
+    "overrides": [
+      {
+        "paths": ["include/cpp/**/*.h", "src/cxx/**/*.h"],
+        "language": "cpp"
+      }
+    ]
+  }
+}
+```
+
+Resolution order is deterministic: configured excludes win first, then the
+first matching `languages.overrides` rule, then the built-in extension mapping.
+Override languages accept the same aliases as `languages.enabled`. Unsupported
+override language names are ignored and reported as indexing warnings. Invalid
+override globs return a validation error. `languages.enabled` filtering is
+applied after overrides, so an overridden `.h` classified as `cpp` is indexed
+only when C++ is enabled.
 
 `index_project.languages` overrides repository config for that index run:
 
