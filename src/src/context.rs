@@ -394,7 +394,8 @@ impl LocalModuleResolver {
             Language::Python => self.resolve_python_import(source, import),
             Language::Rust => self.resolve_rust_import(source, import),
             Language::CSharp => self.resolve_by_candidate(&import.module),
-            Language::C | Language::Cpp | Language::Go => self.resolve_by_candidate(&import.module),
+            Language::C | Language::Cpp => self.resolve_c_cpp_import(source, import),
+            Language::Go => self.resolve_by_candidate(&import.module),
             Language::TypeScript | Language::JavaScript => {
                 self.resolve_js_ts_import(source, import)
             }
@@ -530,6 +531,25 @@ impl LocalModuleResolver {
         self.resolve_by_candidate(&raw.replace('/', "."))
     }
 
+    fn resolve_c_cpp_import(&self, source: &ModuleDef, import: &Import) -> Vec<String> {
+        let raw = import.module.trim();
+        if raw.is_empty() {
+            return Vec::new();
+        }
+
+        let base = source
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let path_targets = self.resolve_path_candidate(&normalize_path(&base.join(raw)));
+        if !path_targets.is_empty() {
+            return path_targets;
+        }
+
+        self.resolve_by_candidate(&raw.replace(['/', '\\'], "."))
+    }
+
     fn resolve_path_candidate(&self, candidate: &Path) -> Vec<String> {
         let mut paths = Vec::new();
         if candidate.extension().is_some() {
@@ -582,6 +602,7 @@ fn module_aliases(module: &ModuleDef, module_name: &str) -> Vec<String> {
     match module.language {
         Language::Rust => rust_module_aliases(module_name),
         Language::CSharp => csharp_module_aliases(module, module_name),
+        Language::C | Language::Cpp => c_cpp_module_aliases(module, module_name),
         _ => Vec::new(),
     }
 }
@@ -603,6 +624,17 @@ fn csharp_module_aliases(module: &ModuleDef, module_name: &str) -> Vec<String> {
         }
     }
     aliases.push(module_name.to_string());
+    aliases
+}
+
+fn c_cpp_module_aliases(module: &ModuleDef, module_name: &str) -> Vec<String> {
+    let mut aliases = vec![module_name.to_string()];
+    if let Some(file_name) = module.path.file_name().and_then(|name| name.to_str()) {
+        aliases.push(file_name.to_string());
+    }
+    if let Some(stem) = module.path.file_stem().and_then(|name| name.to_str()) {
+        aliases.push(stem.to_string());
+    }
     aliases
 }
 

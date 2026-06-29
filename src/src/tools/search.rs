@@ -162,7 +162,8 @@ pub(crate) fn rel(root: &Path, file: &Path) -> String {
 
 pub(crate) fn module_from_file(file: &str) -> String {
     let without_ext = [
-        ".py", ".rs", ".cs", ".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs",
+        ".py", ".rs", ".cs", ".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".c", ".h", ".h++",
+        ".hh", ".hpp", ".hxx", ".c++", ".cc", ".cpp", ".cxx", ".go",
     ]
     .iter()
     .find_map(|ext| file.strip_suffix(ext))

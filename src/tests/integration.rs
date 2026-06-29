@@ -717,6 +717,24 @@ fn smart_code_search_finds_supported_language_files() {
 }
 
 #[test]
+fn smart_code_search_scores_c_results() {
+    let fixture = fixture();
+    let rows = smart_code_search(fixture.path().to_str().unwrap(), "native_login", 1, 10)
+        .expect("smart c");
+
+    assert!(
+        rows.iter()
+            .any(|row| row.file.ends_with("native/auth.c") && row.score > 0.0),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.file.ends_with("native/auth.h") && row.score > 0.0),
+        "{rows:?}"
+    );
+}
+
+#[test]
 fn api_usage_groups_examples() {
     let fixture = fixture();
     let rows = api_usage(fixture.path().to_str().unwrap(), "authenticate", 10, true).expect("api");
@@ -782,6 +800,11 @@ fn coderank_resolves_local_imports_by_language() {
     assert!(
         rows.iter()
             .any(|row| row.module == "web.format" && row.depth > 0)
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.module == "native.auth" && row.imports + row.depth > 0),
+        "{rows:?}"
     );
 }
 
@@ -1612,9 +1635,13 @@ fn query_uses_cached_embeddings_for_semantic_ranking() {
 #[test]
 fn code_hotspots_detects_connected_modules() {
     let fixture = fixture();
-    let rows = code_hotspots(fixture.path().to_str().unwrap(), 5, 1).expect("hotspots");
+    let rows = code_hotspots(fixture.path().to_str().unwrap(), 50, 1).expect("hotspots");
 
     assert!(rows.iter().any(|row| row.module.contains("pkg.core")));
+    assert!(
+        rows.iter().any(|row| row.module == "native.auth"),
+        "{rows:?}"
+    );
 }
 
 #[test]
