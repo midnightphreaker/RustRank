@@ -1,4 +1,4 @@
-name: CI/CD
+name: Release RustRank
 
 on:
   push:
@@ -143,23 +143,13 @@ jobs:
           echo ""
           echo "Release ${NEW_TAG} published with ${ASSET_NAME}"
 
-  mirror-github:
-    needs: release
-    runs-on: docker
-    container:
-      image: alpine:3.20
-
-    steps:
-      - name: Install mirror tooling
-        run: apk add --no-cache git
-
-      - name: Push GitHub mirror with rewritten README URLs
+      - name: Push GitHub mirror and release
         env:
           FORGEJO_TOKEN: ${{ secrets.AUTH_TOKEN }}
           PUSH_TO_GITHUB_PAT: ${{ secrets.PUSH_TO_GITHUB_PAT }}
           GITHUB_MIRROR_URL: https://github.com/midnightphreaker/RustRank
         run: |
-          set -eu
+          set -euo pipefail
 
           if [ -z "${PUSH_TO_GITHUB_PAT:-}" ]; then
             echo "Set the PUSH_TO_GITHUB_PAT secret to a GitHub token with write access to the mirror repository." >&2
@@ -168,6 +158,8 @@ jobs:
 
           github_web_url="$(printf '%s' "$GITHUB_MIRROR_URL" | sed 's#\.git$##')"
           github_push_url="$(printf '%s' "$github_web_url" | sed "s#^https://#https://x-access-token:${PUSH_TO_GITHUB_PAT}@#").git"
+          github_repo="${github_web_url#https://github.com/}"
+          tag="v${{ steps.bump.outputs.new_version }}"
 
           forgejo_repo_url="${FORGEJO_SERVER_URL%/}/${FORGEJO_REPOSITORY}.git"
           if [ -n "${FORGEJO_TOKEN:-}" ]; then
@@ -182,6 +174,8 @@ jobs:
           forgejo_web_url="${FORGEJO_SERVER_URL%/}/${FORGEJO_REPOSITORY}"
           if [ -f README.md ]; then
             sed -i "s#${forgejo_web_url}#${github_web_url}#g" README.md
+            sed -i "s#https://api.phrk.org/v1#https://api.example.com/v1#g" README.md
+            sed -i "s#Forgejo workflow#release workflow#g; s#Forgejo-provided ##g; s#Forgejo release#GitHub release#g" README.md
           fi
 
           git config user.name "Forgejo Actions"
@@ -194,3 +188,35 @@ jobs:
           git remote add github "$github_push_url"
           git push --force github "HEAD:main"
           git push github --tags
+
+          changelog_file="../dist/changelog.md"
+          asset_file="../dist/rustrank-v${{ steps.bump.outputs.new_version }}-linux-x86_64.tar.gz"
+          body="$(cat "$changelog_file")"
+          payload="$(jq -n --arg tag "$tag" --arg name "$tag" --arg body "$body" '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}')"
+          status="$(curl -sS -o /tmp/github-release.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${PUSH_TO_GITHUB_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$payload" \
+            "https://api.github.com/repos/${github_repo}/releases")"
+          if [ "$status" = "422" ]; then
+            release_id="$(curl -fsS \
+              -H "Authorization: Bearer ${PUSH_TO_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${github_repo}/releases/tags/${tag}" | jq -r '.id')"
+          elif [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+            release_id="$(jq -r '.id' /tmp/github-release.json)"
+          else
+            cat /tmp/github-release.json >&2
+            exit 1
+          fi
+          for file in "$asset_file" "$changelog_file"; do
+            curl -fsS \
+              -X POST \
+              -H "Authorization: Bearer ${PUSH_TO_GITHUB_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${file}" \
+              "https://uploads.github.com/repos/${github_repo}/releases/${release_id}/assets?name=$(basename "$file")" \
+              >/dev/null
+          done
