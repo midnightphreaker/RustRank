@@ -1,6 +1,6 @@
 [package]
 name = "rustrank"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "RustRank MCP server for repository analysis"
 
