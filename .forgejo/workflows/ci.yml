@@ -142,3 +142,55 @@ jobs:
 
           echo ""
           echo "Release ${NEW_TAG} published with ${ASSET_NAME}"
+
+  mirror-github:
+    needs: release
+    runs-on: docker
+    container:
+      image: alpine:3.20
+
+    steps:
+      - name: Install mirror tooling
+        run: apk add --no-cache git
+
+      - name: Push GitHub mirror with rewritten README URLs
+        env:
+          FORGEJO_TOKEN: ${{ secrets.AUTH_TOKEN }}
+          PUSH_TO_GITHUB_PAT: ${{ secrets.PUSH_TO_GITHUB_PAT }}
+          GITHUB_MIRROR_URL: https://github.com/midnightphreaker/RustRank
+        run: |
+          set -eu
+
+          if [ -z "${PUSH_TO_GITHUB_PAT:-}" ]; then
+            echo "Set the PUSH_TO_GITHUB_PAT secret to a GitHub token with write access to the mirror repository." >&2
+            exit 1
+          fi
+
+          github_web_url="$(printf '%s' "$GITHUB_MIRROR_URL" | sed 's#\.git$##')"
+          github_push_url="$(printf '%s' "$github_web_url" | sed "s#^https://#https://x-access-token:${PUSH_TO_GITHUB_PAT}@#").git"
+
+          forgejo_repo_url="${FORGEJO_SERVER_URL%/}/${FORGEJO_REPOSITORY}.git"
+          if [ -n "${FORGEJO_TOKEN:-}" ]; then
+            clone_url="$(printf '%s' "$forgejo_repo_url" | sed "s#^https://#https://token:${FORGEJO_TOKEN}@#")"
+          else
+            clone_url="$forgejo_repo_url"
+          fi
+
+          git clone --branch "${FORGEJO_REF_NAME:-main}" "$clone_url" mirror
+          cd mirror
+
+          forgejo_web_url="${FORGEJO_SERVER_URL%/}/${FORGEJO_REPOSITORY}"
+          if [ -f README.md ]; then
+            sed -i "s#${forgejo_web_url}#${github_web_url}#g" README.md
+          fi
+
+          git config user.name "Forgejo Actions"
+          git config user.email "actions@forgejo.local"
+          git add README.md
+          if ! git diff --cached --quiet; then
+            git commit -m "docs: adapt README links for GitHub mirror"
+          fi
+
+          git remote add github "$github_push_url"
+          git push --force github "HEAD:main"
+          git push github --tags
