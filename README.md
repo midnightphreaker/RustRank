@@ -139,7 +139,7 @@ Embedding configuration is optional. It can be provided in `.rustrank_config.jso
 {
   "embeddings": {
     "enabled": true,
-    "base_url": "https://api.phrk.org/v1",
+    "base_url": "https://api.example.com/v1",
     "model": "text-image-embedding",
     "dimensions": 1536
   }
@@ -178,7 +178,7 @@ Enable embedding generation for an index run:
 cargo run -p rustrank -- index-project \
   --repo-path /path/to/repo \
   --embeddings \
-  --embedding-base-url https://api.phrk.org/v1 \
+  --embedding-base-url https://api.example.com/v1 \
   --embedding-model text-image-embedding \
   --embedding-dims 1536
 ```
@@ -406,7 +406,7 @@ rm -rf "$fixture_dir"
 
 ## Release Signals
 
-The Forgejo workflow in `.forgejo/workflows/ci.yml` runs on pushes to `main` that touch source, docs, manifests, README, workflow, or the pre-push hook. It uses a Rust container, installs Rust 1.95.0 plus `clippy` and `rustfmt`, then runs:
+The release workflow in `.forgejo/workflows/ci.yml` runs on pushes to `main` that touch source, docs, manifests, README, workflow, or the pre-push hook. It uses a Rust container, installs Rust 1.95.0 plus `clippy` and `rustfmt`, then runs:
 
 ```bash
 cargo fmt --all -- --check
@@ -415,7 +415,7 @@ cargo test --workspace --all-features --locked
 cargo build --release --locked -p rustrank
 ```
 
-After checks pass, the workflow bumps the patch version in `src/Cargo.toml`, updates Cargo metadata, packages `target/release/rustrank` as a Linux x86_64 tarball, tags the release, creates a Forgejo release, and uploads the asset. The workflow requires the Forgejo-provided repository context and an `AUTH_TOKEN` secret.
+After checks pass, the workflow bumps the patch version in `src/Cargo.toml`, updates Cargo metadata, packages `target/release/rustrank` as a Linux x86_64 tarball, tags the release, creates a GitHub release, and uploads the asset. The workflow requires the repository context and an `AUTH_TOKEN` secret.
 
 ## Additional Validation
 
