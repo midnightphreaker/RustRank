@@ -259,7 +259,10 @@ pub fn supported_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
 pub fn all_supported_source_files(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
     let mut files = Vec::new();
     let excludes = project_config::configured_excludes(root)?;
-    for entry in walkdir::WalkDir::new(root) {
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !excludes.is_excluded(root, entry.path()))
+    {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;

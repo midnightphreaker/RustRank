@@ -17,6 +17,33 @@ mod fixtures;
 
 use fixtures::fixture;
 
+fn write_default_excluded_artifact_sources(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("mcp-server/node_modules/pkg")).expect("node_modules dir");
+    std::fs::write(
+        root.join("mcp-server/node_modules/pkg/index.js"),
+        "export function shouldNotIndexNodeModules() {}",
+    )
+    .expect("node_modules source");
+    std::fs::create_dir_all(root.join("mcp-server/dist")).expect("dist dir");
+    std::fs::write(
+        root.join("mcp-server/dist/bundle.js"),
+        "export function shouldNotIndexDist() {}",
+    )
+    .expect("dist source");
+    std::fs::create_dir_all(root.join("src-tauri/target/debug")).expect("nested target dir");
+    std::fs::write(
+        root.join("src-tauri/target/debug/generated.rs"),
+        "pub fn should_not_index_target() {}",
+    )
+    .expect("target source");
+    std::fs::create_dir_all(root.join(".codex/logs")).expect("codex dir");
+    std::fs::write(
+        root.join(".codex/logs/session.py"),
+        "def should_not_index_codex(): pass",
+    )
+    .expect("codex source");
+}
+
 #[test]
 fn router_registers_agent_facing_tools() {
     assert_eq!(ALL_TOOLS.len(), 19);
@@ -348,6 +375,7 @@ fn supported_source_files_honors_default_and_configured_excludes() {
         "def should_not_index_venv(): pass",
     )
     .expect("venv source");
+    write_default_excluded_artifact_sources(fixture.path());
     std::fs::create_dir_all(fixture.path().join("generated")).expect("generated dir");
     std::fs::write(
         fixture.path().join("generated/probe.py"),
@@ -367,6 +395,10 @@ fn supported_source_files_honors_default_and_configured_excludes() {
         .collect::<Vec<_>>();
 
     assert!(!paths.iter().any(|path| path.contains(".venv")));
+    assert!(!paths.iter().any(|path| path.contains("node_modules")));
+    assert!(!paths.iter().any(|path| path.contains("mcp-server/dist")));
+    assert!(!paths.iter().any(|path| path.contains("src-tauri/target")));
+    assert!(!paths.iter().any(|path| path.contains(".codex")));
     assert!(!paths.iter().any(|path| path.contains("generated")));
     assert!(paths.iter().any(|path| path == "pkg/core.py"));
 }
@@ -640,6 +672,7 @@ fn index_project_honors_configured_excludes() {
         "def should_not_index_venv(): pass",
     )
     .expect("venv source");
+    write_default_excluded_artifact_sources(fixture.path());
     std::fs::create_dir_all(fixture.path().join("generated")).expect("generated dir");
     std::fs::write(
         fixture.path().join("generated/probe.py"),
@@ -663,6 +696,10 @@ fn index_project_honors_configured_excludes() {
 
     assert_eq!(response.indexed_files, 4);
     assert!(!manifest.contains(".venv/probe.py"));
+    assert!(!manifest.contains("mcp-server/node_modules"));
+    assert!(!manifest.contains("mcp-server/dist"));
+    assert!(!manifest.contains("src-tauri/target"));
+    assert!(!manifest.contains(".codex"));
     assert!(!manifest.contains("generated/probe.py"));
     assert!(manifest.contains("pkg/core.py"));
 }

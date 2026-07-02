@@ -86,7 +86,7 @@ RustRank detects supported languages from source extensions, then applies reposi
 
 `.h` files are classified as C by default. Use language overrides when a repository stores C++ headers with `.h` extensions.
 
-Default source excludes include `.git`, `.rustrank`, `target`, `node_modules`, `dist`, `build`, Python virtual environments, Python bytecode/cache directories, common binary media extensions, archives, and object/library outputs.
+Default source excludes apply at any repository depth and include `.git`, `.rustrank`, `.codex`, `.agents`, `target`, `node_modules`, `dist`, `build`, `bin`, `obj`, common JavaScript framework/cache output directories, Python virtual environments, Python bytecode/cache directories, common binary media extensions, archives, and object/library outputs.
 
 ## Configuration
 
