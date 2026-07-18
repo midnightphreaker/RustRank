@@ -171,7 +171,7 @@ rustrank index-project \
 rustrank index-project \
   --repo-path /path/to/repo \
   --embeddings \
-  --embedding-base-url https://api.phrk.org/v1 \
+  --embedding-base-url https://api.example.com/v1 \
   --embedding-model text-image-embedding \
   --embedding-dims 1536
 ```
@@ -341,7 +341,7 @@ Configure embeddings for semantic `query` scoring:
 {
   "embeddings": {
     "enabled": true,
-    "base_url": "https://api.phrk.org/v1",
+    "base_url": "https://api.example.com/v1",
     "model": "text-image-embedding",
     "dimensions": 1536
   }

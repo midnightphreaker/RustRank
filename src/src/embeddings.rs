@@ -12,7 +12,7 @@ use crate::{
     project_config,
 };
 
-pub const DEFAULT_BASE_URL: &str = "https://api.phrk.org/v1";
+pub const DEFAULT_BASE_URL: &str = "https://api.example.com/v1";
 pub const DEFAULT_MODEL: &str = "text-image-embedding";
 pub const DEFAULT_DIMENSIONS: usize = 1536;
 
