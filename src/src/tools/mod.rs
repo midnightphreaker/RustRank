@@ -167,7 +167,12 @@ struct ConfigPathRequest {
 struct SetConfigRequest {
     repo_path: String,
     key: String,
+    #[schemars(schema_with = "arbitrary_json_schema")]
     value: serde_json::Value,
+}
+
+fn arbitrary_json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({})
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -926,5 +931,25 @@ mod tests {
         let values = parse_csv_list(Some(" api.example.test, localhost, api.example.test ,, "));
 
         assert_eq!(values, vec!["api.example.test", "localhost"]);
+    }
+
+    #[test]
+    fn advertised_tool_property_schemas_are_objects() {
+        for tool in RustRankRouter::new().tool_router.list_all() {
+            let Some(properties) = tool.input_schema.get("properties") else {
+                continue;
+            };
+            let properties = properties
+                .as_object()
+                .expect("tool inputSchema.properties should be an object");
+
+            for (name, schema) in properties {
+                assert!(
+                    schema.is_object(),
+                    "{} input property {name} should use an object schema, got {schema}",
+                    tool.name
+                );
+            }
+        }
     }
 }

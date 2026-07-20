@@ -601,11 +601,21 @@ def run_smoke(url: str, repo_path: str, fixture_dir: Path | None = None) -> None
 
     tools_result = rpc(url, "tools/list", {}, request_id)
     request_id += 1
-    names = sorted(tool["name"] for tool in tools_result.get("tools", []))
+    tools = tools_result.get("tools", [])
+    names = sorted(tool["name"] for tool in tools)
     missing = sorted(set(EXPECTED_TOOLS) - set(names))
     unexpected = sorted(set(names) - set(EXPECTED_TOOLS))
     if missing or unexpected:
         raise SmokeFailure(f"tool list mismatch, missing={missing}, unexpected={unexpected}")
+    for tool in tools:
+        properties = tool.get("inputSchema", {}).get("properties", {})
+        if not isinstance(properties, dict):
+            raise SmokeFailure(f"{tool['name']} inputSchema.properties is not an object")
+        for name, schema in properties.items():
+            if not isinstance(schema, dict):
+                raise SmokeFailure(
+                    f"{tool['name']} input property {name} is not an object schema: {schema!r}"
+                )
 
     index_result = call_tool_json(
         url,
