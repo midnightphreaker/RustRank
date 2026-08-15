@@ -21,11 +21,8 @@ extensions:
 | C++ | `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++` |
 | Go | `.go` |
 
-Ignored directories are excluded at any repository depth and include `.git`,
-`.rustrank`, `.codex`, `.agents`, `target`, `node_modules`, `dist`, `build`,
-`bin`, `obj`, common JavaScript framework/cache output directories, Python
-virtual environments, `__pycache__`, `.pytest_cache`, `.mypy_cache`,
-`.ruff_cache`, `.tox`, and `.nox`.
+Ignored directories include `.git`, `.rustrank`, `target`, `node_modules`,
+`dist`, `build`, `.venv`, `venv`, `__pycache__`, and `.pytest_cache`.
 
 `.h` headers are classified as C by default. C-family headers are often
 ambiguous, especially when they contain shared declarations or small portable

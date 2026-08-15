@@ -37,8 +37,7 @@ Existing tools call `supported_source_files`, so config filtering applies to
 parsing, CodeRank, trace, and analysis paths.
 
 The `excludes.paths` and `excludes.extensions` config keys extend RustRank's
-default source exclusions. Directory excludes are pruned during traversal, and
-search paths use the same exclude logic as indexing.
+default source exclusions. Search paths use the same exclude logic as indexing.
 
 ## Persistent Index
 

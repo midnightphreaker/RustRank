@@ -209,7 +209,7 @@ pub fn configured_excludes(repo_path: &Path) -> Result<ConfiguredExcludes> {
     }
 
     let mut builder = GlobSetBuilder::new();
-    for pattern in expand_excluded_path_patterns(path_patterns) {
+    for pattern in path_patterns {
         builder.add(
             GlobBuilder::new(&pattern)
                 .literal_separator(true)
@@ -305,79 +305,16 @@ fn set_nested_value(config: &mut Map<String, Value>, key: &str, value: Value) {
 fn default_excluded_paths() -> Vec<&'static str> {
     vec![
         ".git/**",
-        "**/.git/**",
         ".rustrank/**",
-        "**/.rustrank/**",
-        ".codex/**",
-        "**/.codex/**",
-        ".agents/**",
-        "**/.agents/**",
         "target/**",
-        "**/target/**",
         "node_modules/**",
-        "**/node_modules/**",
         "dist/**",
-        "**/dist/**",
         "build/**",
-        "**/build/**",
-        "bin/**",
-        "**/bin/**",
-        "obj/**",
-        "**/obj/**",
-        "coverage/**",
-        "**/coverage/**",
-        ".next/**",
-        "**/.next/**",
-        ".nuxt/**",
-        "**/.nuxt/**",
-        ".svelte-kit/**",
-        "**/.svelte-kit/**",
-        ".turbo/**",
-        "**/.turbo/**",
-        ".vite/**",
-        "**/.vite/**",
-        ".parcel-cache/**",
-        "**/.parcel-cache/**",
-        ".cache/**",
-        "**/.cache/**",
         ".venv/**",
-        "**/.venv/**",
         "venv/**",
-        "**/venv/**",
-        "env/**",
-        "**/env/**",
         "**/__pycache__/**",
         ".pytest_cache/**",
-        "**/.pytest_cache/**",
-        ".mypy_cache/**",
-        "**/.mypy_cache/**",
-        ".ruff_cache/**",
-        "**/.ruff_cache/**",
-        ".tox/**",
-        "**/.tox/**",
-        ".nox/**",
-        "**/.nox/**",
     ]
-}
-
-fn expand_excluded_path_patterns(patterns: Vec<String>) -> Vec<String> {
-    let mut expanded = Vec::new();
-    let mut seen = HashSet::new();
-    for pattern in patterns {
-        push_unique_pattern(&mut expanded, &mut seen, pattern.clone());
-        if let Some(dir_pattern) = pattern.strip_suffix("/**")
-            && !dir_pattern.is_empty()
-        {
-            push_unique_pattern(&mut expanded, &mut seen, dir_pattern.to_string());
-        }
-    }
-    expanded
-}
-
-fn push_unique_pattern(expanded: &mut Vec<String>, seen: &mut HashSet<String>, pattern: String) {
-    if seen.insert(pattern.clone()) {
-        expanded.push(pattern);
-    }
 }
 
 fn default_excluded_extensions() -> Vec<&'static str> {
