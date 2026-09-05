@@ -1,5 +1,7 @@
 # RustRank
 
+Repository: https://git.phrk.org/pub/RustRank
+
 RustRank is a Rust MCP server for repository analysis. It indexes source files into a repository-local cache, exposes MCP tools for code search and graph-oriented inspection, and writes an `AGENTS.md` section that summarizes the indexed codebase for future agent work.
 
 RustRank runs as a local stdio MCP server by default. It can also run as a stateless Streamable HTTP server for Docker, remote clients, or smoke testing.
@@ -423,7 +425,7 @@ rm -rf "$fixture_dir"
 
 ## Release Signals
 
-The release workflow in `.forgejo/workflows/ci.yml` runs on pushes to `main` that touch source, docs, manifests, README, workflow, or the pre-push hook. It uses a Rust container, installs Rust 1.95.0 plus `clippy` and `rustfmt`, then runs:
+The Forgejo release workflow runs automatically when a push to the default branch changes the application version. Manual runs offer `Major` (increment the middle component), `minor` (increment the final component), and `retry` (publish the current version). It installs Rust 1.98.1 plus `clippy` and `rustfmt`, then runs:
 
 ```bash
 cargo fmt --all -- --check
@@ -432,7 +434,7 @@ cargo test --workspace --all-features --locked
 cargo build --release --locked -p rustrank
 ```
 
-After checks pass, the workflow bumps the patch version in `src/Cargo.toml`, updates Cargo metadata, packages `target/release/rustrank` as a Linux x86_64 tarball, tags the release, creates a GitHub release, and uploads the asset. The workflow requires the repository context and an `AUTH_TOKEN` secret.
+After checks and builds pass, the workflow commits synchronized version files, packages the Linux amd64 binary as `RustRank.vVERSION-linux-amd64.tar.gz`, and publishes the release at https://git.phrk.org/pub/RustRank/releases. Publication retries reuse the same version. The workflow requires `RELEASE_TOKEN` and `RELEASE_USER` secrets with repository and release write access.
 
 ## Additional Validation
 

@@ -830,7 +830,8 @@ fn lazy_python_def(line: &str, line_no: usize) -> Option<Definition> {
         (DefKind::Func, rest)
     } else if let Some(rest) = trimmed.strip_prefix("def ") {
         (DefKind::Func, rest)
-    } else if let Some(rest) = trimmed.strip_prefix("class ") {
+    } else {
+        let rest = trimmed.strip_prefix("class ")?;
         let name_end = rest.find(['(', ':']).unwrap_or(rest.len());
         let kind = if rest[name_end..].trim_start().starts_with('(') {
             DefKind::Struct
@@ -838,8 +839,6 @@ fn lazy_python_def(line: &str, line_no: usize) -> Option<Definition> {
             DefKind::Class
         };
         (kind, rest)
-    } else {
-        return None;
     };
 
     let name_end = rest.find(['(', ':']).unwrap_or(rest.len());
