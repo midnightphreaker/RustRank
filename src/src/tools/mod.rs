@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod analysis;
 pub mod code_rank;
+mod compat;
 pub mod config;
 pub mod index;
 pub mod search;
@@ -15,9 +16,9 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-        ServerInfo,
+        CallToolResult, Content, Implementation, ListResourceTemplatesResult, ListResourcesResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+        ServerCapabilities, ServerInfo,
     },
     schemars,
     service::{RequestContext, RoleServer},
@@ -167,7 +168,14 @@ struct ConfigPathRequest {
 struct SetConfigRequest {
     repo_path: String,
     key: String,
+    #[schemars(schema_with = "config_value_schema")]
     value: serde_json::Value,
+}
+
+fn config_value_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    // Object-form schemas work with clients whose MCP models reject boolean schemas.
+    // Like `true`, this accepts every JSON value, including null and arrays.
+    schemars::json_schema!({"description": "Configuration value (any JSON value)"})
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -309,7 +317,7 @@ impl RustRankRouter {
     #[tool(
         description = "Index a repository into persistent per-language caches and a project manifest"
     )]
-    fn index_project(&self, Parameters(req): Parameters<IndexProjectRequest>) -> String {
+    fn index_project(&self, Parameters(req): Parameters<IndexProjectRequest>) -> CallToolResult {
         let repo_path = req.repo_path.clone();
         let result = crate::index::index_project_with_embeddings(
             &req.repo_path,
@@ -333,7 +341,10 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Search repository files for a pattern with line context")]
-    fn contextual_search(&self, Parameters(req): Parameters<ContextualSearchRequest>) -> String {
+    fn contextual_search(
+        &self,
+        Parameters(req): Parameters<ContextualSearchRequest>,
+    ) -> CallToolResult {
         json(search::contextual_search(
             &req.path,
             &req.pattern,
@@ -344,7 +355,10 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Search code and rank results by module importance")]
-    fn smart_code_search(&self, Parameters(req): Parameters<SmartCodeSearchRequest>) -> String {
+    fn smart_code_search(
+        &self,
+        Parameters(req): Parameters<SmartCodeSearchRequest>,
+    ) -> CallToolResult {
         json(search::smart_code_search(
             &req.repo_path,
             &req.pattern,
@@ -354,7 +368,7 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Find API usage examples grouped by usage pattern")]
-    fn api_usage(&self, Parameters(req): Parameters<ApiUsageRequest>) -> String {
+    fn api_usage(&self, Parameters(req): Parameters<ApiUsageRequest>) -> CallToolResult {
         json(search::api_usage(
             &req.repo_path,
             &req.api_name,
@@ -364,7 +378,7 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Rank Python modules using import-graph PageRank")]
-    fn coderank_analysis(&self, Parameters(req): Parameters<CodeRankRequest>) -> String {
+    fn coderank_analysis(&self, Parameters(req): Parameters<CodeRankRequest>) -> CallToolResult {
         json(code_rank::coderank_analysis(
             &req.repo_path,
             req.top_n,
@@ -374,7 +388,7 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Find modules that are important and frequently referenced")]
-    fn code_hotspots(&self, Parameters(req): Parameters<HotspotRequest>) -> String {
+    fn code_hotspots(&self, Parameters(req): Parameters<HotspotRequest>) -> CallToolResult {
         json(code_rank::code_hotspots(
             &req.repo_path,
             req.top_n,
@@ -383,7 +397,7 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Trace occurrences and transformations of a data identifier")]
-    fn trace_data_flow(&self, Parameters(req): Parameters<DataFlowRequest>) -> String {
+    fn trace_data_flow(&self, Parameters(req): Parameters<DataFlowRequest>) -> CallToolResult {
         json(trace::trace_data_flow(
             &req.repo_path,
             &req.identifier,
@@ -393,7 +407,7 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Map feature keywords across code layers")]
-    fn trace_feature_impl(&self, Parameters(req): Parameters<FeatureRequest>) -> String {
+    fn trace_feature_impl(&self, Parameters(req): Parameters<FeatureRequest>) -> CallToolResult {
         let keywords = req
             .feature_keywords
             .iter()
@@ -403,12 +417,12 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Find direct dependency impact for a target module")]
-    fn trace_dep_impact(&self, Parameters(req): Parameters<DepImpactRequest>) -> String {
+    fn trace_dep_impact(&self, Parameters(req): Parameters<DepImpactRequest>) -> CallToolResult {
         json(trace::trace_dep_impact(&req.repo_path, &req.target_module))
     }
 
     #[tool(description = "Find error handling patterns and antipatterns")]
-    fn error_patterns(&self, Parameters(req): Parameters<ErrorPatternsRequest>) -> String {
+    fn error_patterns(&self, Parameters(req): Parameters<ErrorPatternsRequest>) -> CallToolResult {
         json(analysis::error_patterns(
             &req.repo_path,
             req.include_antipatterns,
@@ -418,7 +432,7 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Detect simple performance bottleneck patterns")]
-    fn perf_bottleneck(&self, Parameters(req): Parameters<PerfRequest>) -> String {
+    fn perf_bottleneck(&self, Parameters(req): Parameters<PerfRequest>) -> CallToolResult {
         let focus = req
             .focus_areas
             .iter()
@@ -432,7 +446,7 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Trace branch and loop execution paths for a function")]
-    fn exec_paths(&self, Parameters(req): Parameters<ExecPathsRequest>) -> String {
+    fn exec_paths(&self, Parameters(req): Parameters<ExecPathsRequest>) -> CallToolResult {
         json(analysis::exec_paths(
             &req.repo_path,
             &req.function_name,
@@ -442,7 +456,7 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Trace branch and loop execution paths for a function")]
-    fn execute_paths(&self, Parameters(req): Parameters<ExecPathsRequest>) -> String {
+    fn execute_paths(&self, Parameters(req): Parameters<ExecPathsRequest>) -> CallToolResult {
         json(analysis::execute_paths(
             &req.repo_path,
             &req.function_name,
@@ -452,36 +466,36 @@ impl RustRankRouter {
     }
 
     #[tool(description = "Read RustRank JSON configuration")]
-    fn get_config(&self, Parameters(req): Parameters<ConfigPathRequest>) -> String {
+    fn get_config(&self, Parameters(req): Parameters<ConfigPathRequest>) -> CallToolResult {
         json(config::get_config(&req.repo_path))
     }
 
     #[tool(description = "Set a RustRank JSON configuration value")]
-    fn set_config(&self, Parameters(req): Parameters<SetConfigRequest>) -> String {
+    fn set_config(&self, Parameters(req): Parameters<SetConfigRequest>) -> CallToolResult {
         json(config::set_config(&req.repo_path, &req.key, req.value))
     }
 
     #[tool(
         description = "Return callers, callees, imports, defining file, and resources for one symbol"
     )]
-    fn context(&self, Parameters(req): Parameters<ContextRequest>) -> String {
+    fn context(&self, Parameters(req): Parameters<ContextRequest>) -> CallToolResult {
         json(agent::symbol_context(&req.repo_path, &req.symbol))
     }
 
     #[tool(description = "Estimate upstream and downstream blast radius for a symbol or module")]
-    fn impact(&self, Parameters(req): Parameters<ImpactRequest>) -> String {
+    fn impact(&self, Parameters(req): Parameters<ImpactRequest>) -> CallToolResult {
         json(agent::impact(&req.repo_path, &req.target, req.max_depth))
     }
 
     #[tool(description = "Map git diff hunks to changed symbols and affected callers/importers")]
-    fn detect_changes(&self, Parameters(req): Parameters<ConfigPathRequest>) -> String {
+    fn detect_changes(&self, Parameters(req): Parameters<ConfigPathRequest>) -> CallToolResult {
         json(agent::detect_changes(&req.repo_path))
     }
 
     #[tool(
         description = "Agent-oriented graph search combining lexical matches and module centrality"
     )]
-    fn query(&self, Parameters(req): Parameters<QueryRequest>) -> String {
+    fn query(&self, Parameters(req): Parameters<QueryRequest>) -> CallToolResult {
         json(agent::query(&req.repo_path, &req.query, req.limit))
     }
 }
@@ -495,6 +509,10 @@ impl ServerHandler for RustRankRouter {
                 .enable_resources()
                 .build(),
         )
+        .with_server_info(Implementation::new(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
         .with_instructions("RustRank repository analysis tools")
     }
 
@@ -659,8 +677,10 @@ fn transport_from_value(value: Option<&str>) -> Transport {
 }
 
 async fn serve_stdio() -> anyhow::Result<()> {
+    let (read, write) = rmcp::transport::stdio();
+    let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write);
     let service = RustRankRouter::new()
-        .serve(rmcp::transport::stdio())
+        .serve(compat::LegacyDiscoveryTransport(transport))
         .await?;
     service.waiting().await?;
     Ok(())
@@ -844,11 +864,15 @@ fn allowed_hosts_for(addr: SocketAddr) -> Vec<String> {
     hosts
 }
 
-fn json<T: serde::Serialize>(result: crate::Result<T>) -> String {
-    match result {
-        Ok(value) => serde_json::to_string(&value)
-            .unwrap_or_else(|err| serde_json::json!({ "error": err.to_string() }).to_string()),
-        Err(err) => serde_json::json!({ "error": err.to_string() }).to_string(),
+fn json<T: serde::Serialize>(result: crate::Result<T>) -> CallToolResult {
+    let serialized = result
+        .map_err(|err| err.to_string())
+        .and_then(|value| serde_json::to_string(&value).map_err(|err| err.to_string()));
+    match serialized {
+        Ok(text) => CallToolResult::success(vec![Content::text(text)]),
+        Err(error) => CallToolResult::error(vec![Content::text(
+            serde_json::json!({ "error": error }).to_string(),
+        )]),
     }
 }
 
