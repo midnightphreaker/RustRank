@@ -1,421 +1,81 @@
 # RustRank
 
-Repository: https://git.phrk.org/pub/RustRank
+<p align="center"><img src="src/src/assets/rustrank.png" width="128" height="128" alt="RustRank crab and magnifying glass"></p>
 
-RustRank is a Rust MCP server for repository analysis. It indexes source files into a repository-local cache, exposes MCP tools for code search and graph-oriented inspection, and writes an `AGENTS.md` section that summarizes the indexed codebase for future agent work.
+RustRank helps coding assistants find relevant code, understand dependencies, and assess the impact of a change. It combines source parsing, import-graph ranking, and optional semantic search in a Rust [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server, with a standalone indexing CLI.
 
-RustRank runs as a local stdio MCP server by default. It can also run as a stateless Streamable HTTP server for Docker, remote clients, or smoke testing.
+- **Eight languages:** Python, Rust, C#, TypeScript, JavaScript, C, C++, and Go.
+- **19 MCP tools:** indexing, code search, symbol context, dependency inspection, and change analysis.
+- **Optional embeddings:** search function-aware source chunks using an OpenAI-compatible embedding endpoint. Structural indexing and text/graph search work without one.
+- **Local indexes:** cache source facts in the repository and generate guidance for future agent sessions.
+- **Two transports:** local stdio or Streamable HTTP with JSON responses.
 
-## Quick Start
+[Project on GitHub](https://github.com/midnightphreaker/RustRank) · [Forgejo source](https://git.phrk.org/pub/RustRank) · [Releases](https://git.phrk.org/pub/RustRank/releases)
 
-Build the binary:
+## Contents
+
+- [Quickstart](#quickstart)
+- [Connect an MCP client](#connect-an-mcp-client)
+- [Typical workflow](#typical-workflow)
+- [Configuration](#configuration)
+- [Standalone CLI](#standalone-cli)
+- [Docker setup](#docker-setup)
+- [Tools and resources](#tools-and-resources)
+- [Supported languages](#supported-languages)
+- [Files RustRank writes](#files-rustrank-writes)
+- [Definitions](#definitions)
+- [Troubleshooting and limits](#troubleshooting-and-limits)
+- [Development](#development)
+
+## Quickstart
+
+You need Git, a Rust toolchain with Cargo, and the native compiler/linker tools required to build Rust dependencies. The project uses Rust edition 2024; CI currently tests Rust **1.98.1**. An embedding service is optional.
+
+Build from source:
 
 ```bash
-cargo build -p rustrank --release
+git clone https://git.phrk.org/pub/RustRank
+cd RustRank
+cargo build --locked --release -p rustrank
 ```
 
-List the registered MCP tools:
+Check the binary and index RustRank itself as a first run:
 
 ```bash
-target/release/rustrank --list-tools
+./target/release/rustrank --list-tools
+./target/release/rustrank index-project --repo-path .
+# Prints a JSON summary; writes .rustrank/index/v1/project_manifest.json.
 ```
 
-Index a repository:
+Replace `.` with the path to your own repository when ready. The CLI summary includes indexed file counts, language summaries, cache hits/misses, and warnings.
 
-```bash
-target/release/rustrank index-project --repo-path /path/to/repo --clean-stale
-```
+For a prebuilt binary, see [Releases](https://git.phrk.org/pub/RustRank/releases). The release workflow currently targets **Linux amd64**. The instructions below assume a source build; substitute your installed binary path if using a release archive.
 
-Run RustRank as a stdio MCP server:
+## Connect an MCP client
 
-```bash
-target/release/rustrank
-```
+### Local stdio
 
-For development, the same paths work through Cargo:
-
-```bash
-cargo run -p rustrank -- --list-tools
-cargo run -p rustrank -- index-project --repo-path /path/to/repo --clean-stale
-```
-
-## What RustRank Writes
-
-`index_project` and the `index-project` CLI command write deterministic JSON under the target repository:
-
-```text
-repo_path/.rustrank/index/v1/
-```
-
-The index contains:
-
-- `project_manifest.json`: repository-level modules, graph nodes, import edges, unresolved imports, process flows, and freshness metadata.
-- `languages/LANGUAGE/index.json`: one shard per indexed language.
-- `languages/LANGUAGE/files/CONTENT_HASH.json`: per-file facts keyed by source content hash.
-- `embeddings/CHUNK_ID.json`: optional function/source chunk vectors with source line spans, model and source freshness metadata.
-
-RustRank also creates or updates:
-
-```text
-repo_path/AGENTS.md
-```
-
-Manual AGENTS content is preserved outside the generated section:
-
-```text
-<!-- rustrank-index:start -->
-<!-- rustrank-index:end -->
-```
-
-The cache stores metadata such as relative source paths, module names, symbols, imports, declared C# namespaces, graph edges, and file hashes. It is designed not to store source snippets, absolute repository paths, timestamps, or secrets.
-
-Use a writable `repo_path` for `index_project` and `set_config`; those operations can write `.rustrank_config.json`, `.rustrank/index/v1/`, and `AGENTS.md`.
-
-## Supported Languages
-
-RustRank detects supported languages from source extensions, then applies repository configuration and excludes.
-
-| Language | Config name | Extensions | Accepted aliases |
-| --- | --- | --- | --- |
-| Python | `python` | `.py` | `py` |
-| Rust | `rust` | `.rs` | `rs` |
-| C# | `csharp` | `.cs` | `c#`, `cs` |
-| TypeScript | `typescript` | `.ts`, `.tsx` | `ts`, `tsx` |
-| JavaScript | `javascript` | `.js`, `.jsx`, `.mjs`, `.cjs` | `js`, `jsx`, `mjs`, `cjs` |
-| C | `c` | `.c`, `.h` | `c` |
-| C++ | `cpp` | `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++` | `c++`, `cc`, `cxx`, `h++`, `hh`, `hpp`, `hxx` |
-| Go | `go` | `.go` | `golang` |
-
-`.h` files are classified as C by default. Use language overrides when a repository stores C++ headers with `.h` extensions.
-
-Default source excludes include `.git`, `.rustrank`, `target`, `node_modules`, `dist`, `build`, Python virtual environments, Python bytecode/cache directories, common binary media extensions, archives, and object/library outputs.
-
-## Configuration
-
-Repository configuration lives at:
-
-```text
-repo_path/.rustrank_config.json
-```
-
-When `languages.enabled` is missing or empty, RustRank auto-detects languages from current source files:
+Configure your client to launch the binary using an **absolute path**. In clients that accept an `mcpServers` JSON configuration:
 
 ```json
 {
-  "languages": {
-    "enabled": ["python", "rust", "typescript"]
-  }
-}
-```
-
-Path overrides are checked before extension mapping:
-
-```json
-{
-  "languages": {
-    "enabled": ["c", "cpp"],
-    "overrides": [
-      {
-        "paths": ["include/cpp/**/*.h", "src/cxx/**/*.h"],
-        "language": "cpp"
+  "mcpServers": {
+    "rustrank": {
+      "command": "/absolute/path/to/RustRank/target/release/rustrank",
+      "args": [],
+      "env": {
+        "RUSTRANK_TRANSPORT": "stdio"
       }
-    ]
+    }
   }
 }
 ```
 
-Additional excludes can be configured with path globs and extensions:
+Adapt the configuration wrapper to your client. No server arguments are needed. Stdio is the native default: the client communicates through stdin/stdout, and RustRank opens no listening port. Diagnostics go to stderr.
 
-```json
-{
-  "excludes": {
-    "paths": [".tox/**", "generated/**"],
-    "extensions": ["sqlite", ".bin"]
-  }
-}
-```
+Launching the binary directly in a terminal starts the MCP server and waits for protocol messages; it is not an interactive command prompt.
 
-### MCP embedding endpoint
-
-Configure the MCP server process before starting RustRank:
-
-```bash
-export RUSTRANK_EMBEDDING_BASE_URL=https://api.example.com/v1
-export RUSTRANK_EMBEDDING_MODEL=your-embedding-model
-export RUSTRANK_EMBEDDING_DIMS=1536
-# Optional: set RUSTRANK_EMBEDDING_API_KEY in the server environment if required.
-```
-
-The base URL, model and positive integer dimensions enable embeddings for MCP
-indexing and semantic `query`. Structural indexing works without them. The key is optional; unset or blank means no
-Authorization header. These four settings are no longer tool arguments and
-repository configuration cannot override them for MCP indexing. Pass the
-variables to the server process in your MCP client's environment settings, or
-with Docker `-e` options.
-
-At startup RustRank sends a small test input to `<base_url>/embeddings`, with a
-five-second request timeout. It checks HTTP success, the embedding response and
-vector dimensions. Missing/invalid settings, connection or authentication
-failures, unsupported models/endpoints, and malformed or mismatched vectors are
-logged to stderr as a debug diagnostic. RustRank continues serving every tool.
-`index_project` still builds the structural index and includes the saved problem
-in its warnings; no embedding requests are made. `query` still performs text
-and graph matching. Correct the server environment or endpoint and restart
-RustRank to enable embeddings. HTTP client connections reuse the startup result
-rather than probing again.
-
-After successful validation, `index_project` generates embeddings by default;
-`embeddings: false` skips vector generation for that call. MCP `query` uses the
-same endpoint, model, dimensions and optional API key as indexing, including
-when the repository has no embedding configuration.
-
-Source is split at function boundaries; oversized functions and module-level
-text are split further into chunks of at most 4,096 UTF-8 bytes and 80 lines.
-These are byte/line limits, not a model-specific token guarantee. Chunk vectors
-retain file, symbol and line locations, so semantic scores apply to the matching
-chunk rather than every function in a file. Cache identity includes source and
-chunk contents, location, endpoint, model and dimensions. Query ignores vectors
-from changed/deleted files, other endpoints/models and the legacy whole-file
-format. Re-run indexing to generate chunk vectors after upgrading; old cache
-files can remain on disk but do not affect results.
-
-Later embedding request failures are returned as indexing warnings; semantic
-query falls back to text and graph matching. The standalone `index-project` CLI
-and library callers retain their existing optional repository configuration and
-embedding flags; MCP operations use the server environment.
-
-## CLI
-
-General help:
-
-```bash
-cargo run -p rustrank -- --help
-```
-
-Index command help:
-
-```bash
-cargo run -p rustrank -- index-project --help
-```
-
-Index a repository with selected languages and a clean rebuild:
-
-```bash
-cargo run -p rustrank -- index-project \
-  --repo-path /path/to/repo \
-  --languages python,rust,typescript \
-  --force-rebuild \
-  --clean-stale
-```
-
-Enable embedding generation for an index run:
-
-```bash
-cargo run -p rustrank -- index-project \
-  --repo-path /path/to/repo \
-  --embeddings \
-  --embedding-base-url https://api.example.com/v1 \
-  --embedding-model text-image-embedding \
-  --embedding-dims 1536
-```
-
-`index-project` prints a JSON summary with cache paths, scanned and indexed file counts, cache hits and misses, stale cache removals, per-language summaries, and warnings.
-
-## MCP Tools
-
-`rustrank --list-tools` currently prints 19 MCP tools:
-
-| Tool | Purpose |
-| --- | --- |
-| `index_project` | Build persistent per-language caches, the project manifest, optional embedding cache files, and the generated AGENTS section. |
-| `contextual_search` | Search repository files for a text or regex pattern with line context. |
-| `smart_code_search` | Search supported source files and rank results by module importance. |
-| `api_usage` | Find examples of an API, function, method, or identifier. |
-| `coderank_analysis` | Rank modules with import-graph PageRank. |
-| `code_hotspots` | Find modules with high connectivity and textual/change frequency. |
-| `trace_data_flow` | Trace definitions, usages, assignments, returns, and raises for an identifier. |
-| `trace_feature_impl` | Map feature keywords across source files and coarse code layers. |
-| `trace_dep_impact` | Find direct import dependents of a target module. |
-| `error_patterns` | Find error-handling patterns and optional antipatterns. |
-| `perf_bottleneck` | Detect simple performance-pattern matches or custom focus strings. |
-| `exec_paths` | Trace branches, loops, and optional call contexts inside a function. |
-| `execute_paths` | Alias for `exec_paths`. |
-| `get_config` | Read raw RustRank JSON configuration. |
-| `set_config` | Write a top-level or dotted JSON configuration value. |
-| `context` | Return callers, callees, imports, defining file, and related resources for a symbol. |
-| `impact` | Estimate upstream and downstream blast radius for a symbol or module. |
-| `detect_changes` | Map git worktree diff hunks to changed symbols and affected callers/importers. |
-| `query` | Run agent-oriented graph search with lexical, centrality, process, and optional semantic signals. |
-
-The MCP server also exposes resources for clients that support MCP resources:
-
-```text
-rustrank://repo/current/context
-rustrank://repo/current/schema
-rustrank://repo/current/modules
-rustrank://repo/current/processes
-rustrank://repo/current/module/{name}
-rustrank://repo/current/process/{name}
-```
-
-Resource reads use the current repository set by `index_project` or fall back to the server process working directory.
-
-## Stdio
-
-Stdio is RustRank's native default: it reads MCP messages from standard input,
-writes responses to standard output, and opens no network port. Build the release
-binary and use its absolute path:
-
-```bash
-cargo build -p rustrank --release
-realpath target/release/rustrank
-```
-
-Use the path printed by `realpath` as the MCP command value in clients that accept JSON server configuration.
-
-Codex CLI stdio registration:
-
-```bash
-codex mcp add rustrank -- "$(realpath target/release/rustrank)"
-```
-
-The Docker image defaults to HTTP, so explicitly select stdio and keep standard
-input open when using it as an MCP server:
-
-```bash
-docker run --rm -i \
-  -e RUSTRANK_TRANSPORT=stdio \
-  -v "$PWD:/workspace/repo" \
-  rustrank:local
-```
-
-`RUSTRANK_TRANSPORT` is unset (or `stdio`) for stdio. The aliases `http`,
-`streamable_http`, and `streamable-http` select Streamable HTTP instead.
-
-## MCP Client Setup
-
-For HTTP clients, start RustRank with Streamable HTTP and register the URL:
-
-```bash
-RUSTRANK_TRANSPORT=streamable_http \
-RUSTRANK_HOST=127.0.0.1 \
-RUSTRANK_PORT=63477 \
-target/release/rustrank
-```
-
-```text
-http://127.0.0.1:63477/mcp
-```
-
-Codex CLI HTTP registration:
-
-```bash
-codex mcp add rustrank-http --url http://127.0.0.1:63477/mcp
-```
-
-## Streamable HTTP
-
-The default transport is stdio. HTTP mode is selected with:
-
-```bash
-RUSTRANK_TRANSPORT=streamable_http target/release/rustrank
-```
-
-The HTTP server exposes:
-
-```text
-POST /mcp
-GET /healthz
-```
-
-Local health check:
-
-```bash
-curl -fsS http://127.0.0.1:63477/healthz
-```
-
-Environment variables:
-
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `RUSTRANK_TRANSPORT` | stdio | `http`, `streamable_http`, and `streamable-http` select HTTP. Unset, `stdio`, or other values select stdio. |
-| `RUSTRANK_LISTEN_ADDR` | unset | Full socket address. Takes precedence over `RUSTRANK_HOST` and `RUSTRANK_PORT`. |
-| `RUSTRANK_HOST` | `127.0.0.1` | Host used when `RUSTRANK_LISTEN_ADDR` is unset. Docker sets `0.0.0.0`. |
-| `RUSTRANK_PORT` | `63477` | Port used when `RUSTRANK_LISTEN_ADDR` is unset. |
-| `RUSTRANK_MCP_PATH` | `/mcp` | HTTP MCP path. Values are normalized with a leading slash; `/` and `/healthz` are rejected. |
-| `RUSTRANK_ALLOWED_HOSTS` | loopback hosts plus bound host/host:port | Comma-separated hostnames, IPs, or authorities accepted by RMCP host validation. |
-| `RUSTRANK_ALLOWED_ORIGINS` | unset | Comma-separated origins. Empty means Origin validation is disabled. |
-| `RUSTRANK_DISABLE_HOST_CHECK` | `false` | `true`, `1`, `yes`, and `on` disable allowed-host checks. Use only on trusted networks. |
-| `RUST_LOG` | unset locally, `info` in Docker | Standard Rust logging filter. |
-
-Legacy `RUSTANK_*` spellings are still read for the RustRank-specific HTTP variables.
-
-## Docker
-
-Build the image:
-
-```bash
-docker build -t rustrank:local .
-```
-
-Run the HTTP server against a mounted repository:
-
-```bash
-docker run --rm \
-  --name rustrank \
-  -p 127.0.0.1:63477:63477 \
-  -v "$PWD:/workspace/repo" \
-  rustrank:local
-```
-
-The Docker image:
-
-- runs `rustrank` as the entrypoint
-- defaults to Streamable HTTP on `0.0.0.0:63477`
-- serves MCP at `/mcp`
-- exposes `/healthz`
-- runs as UID `10001`
-- uses `/workspace` as the working directory
-
-Use a read-write mount when calling `index_project` or `set_config`, because those tools write to the target repository. A read-only mount is suitable only for tools that do not write config, indexes, or `AGENTS.md`.
-
-For remote HTTP clients, add the externally visible hostname or `host:port` to `RUSTRANK_ALLOWED_HOSTS`.
-
-## Development
-
-The repository is a Cargo workspace with one crate in `src/`. The binary entrypoint delegates to `rustrank::tools::serve()`, which handles CLI utility paths, stdio transport, and Streamable HTTP transport.
-
-Core modules:
-
-| Module | Responsibility |
-| --- | --- |
-| `context` | Source discovery, language detection, parsing, module definitions, and import resolution. |
-| `project_config` | Raw JSON config I/O, language selection, path overrides, and excludes. |
-| `index` | Persistent cache generation, manifest generation, embedding indexing integration, and AGENTS section updates. |
-| `embeddings` | OpenAI-compatible embedding requests, cache reads/writes, and semantic scoring. |
-| `process` | Lightweight process-flow derivation from call edges. |
-| `tools::*` | MCP request handlers, resources, CLI routing, transports, and JSON formatting. |
-| `fmt` | Shared output row types. |
-| `error` | Application error and crate result types. |
-
-Common local commands:
-
-```bash
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-python3 -m py_compile scripts/smoke_http_json.py
-cargo run -p rustrank -- --list-tools
-```
-
-The repository includes a pre-push hook script with the main Rust checks:
-
-```bash
-.githooks/pre-push
-```
-
-## Smoke Testing HTTP
+### Streamable HTTP
 
 Start a local HTTP server:
 
@@ -423,55 +83,352 @@ Start a local HTTP server:
 RUSTRANK_TRANSPORT=streamable_http \
 RUSTRANK_HOST=127.0.0.1 \
 RUSTRANK_PORT=63477 \
-cargo run -p rustrank
+./target/release/rustrank
 ```
 
-In another shell, run the no-SSE Streamable HTTP smoke test:
+Register `http://127.0.0.1:63477/mcp` as a **Streamable HTTP** server in your client. Check service availability from another terminal:
 
 ```bash
-python3 scripts/smoke_http_json.py --url http://127.0.0.1:63477/mcp
+curl -fsS http://127.0.0.1:63477/healthz
+# ok
 ```
 
-To exercise vector generation, start the server with the valid embedding environment above; without it the smoke test exercises structural fallback. It creates a temporary multi-language fixture, initializes MCP, verifies the tool list, calls `index_project` with and without vector generation, exercises resources, and calls each expected tool. Startup failures and optional authentication are covered by the Rust MCP compatibility tests.
+HTTP uses stateless JSON responses, without an SSE event stream. `/healthz` confirms the HTTP service is running; it does not validate the embedding endpoint.
 
-For Docker smoke testing:
+For a reverse proxy or remote hostname, configure `RUSTRANK_ALLOWED_HOSTS` with the hostname or `host:port` clients use. Host/origin checks are not user authentication; remote deployments need an appropriate access-control layer.
+
+## Typical workflow
+
+1. **Index:** call `index_project` before exploration and after source changes.
+2. **Find:** use `query` for ranked module/symbol/chunk matches, or `contextual_search` for exact text and regex searches.
+3. **Inspect:** use `context` for a symbol and `impact` before changing shared code.
+4. **Review:** use `detect_changes` for unstaged tracked-file edits, then refresh the index.
+
+Example arguments for the MCP **`index_project`** tool:
+
+```json
+{
+  "repo_path": "/absolute/path/to/repo",
+  "force_rebuild": false,
+  "clean_stale": false
+}
+```
+
+`repo_path`, `force_rebuild`, and `clean_stale` are required. Optional `languages` selects a list of languages; optional `embeddings` defaults to enabled when the server has a validated endpoint. Set it to `false` to skip vector generation for that run. Endpoint details and API keys are **server configuration, not tool arguments**.
+
+Example arguments for **`query`**:
+
+```json
+{
+  "repo_path": "/absolute/path/to/repo",
+  "query": "authentication token validation",
+  "limit": 10
+}
+```
+
+Paths are resolved on the machine running RustRank. A remote server cannot read a client-local path, and Docker tool calls must use the mounted container path.
+
+## Configuration
+
+There are two configuration scopes:
+
+| Scope | Location | Controls |
+| --- | --- | --- |
+| MCP server | Process environment / MCP client's server environment | Transport, HTTP settings, embedding endpoint and optional API key. |
+| Repository | `<repo_path>/.rustrank_config.json` | Enabled languages, path overrides, exclusions; optional embedding settings for CLI/library callers. |
+
+**MCP indexing and semantic query share the same environment-based embedding settings.** Repository embedding settings cannot override them. The standalone CLI uses its own flags and repository settings; see [Standalone CLI](#standalone-cli).
+
+### Repository settings
+
+No config file is required. To customize a repository, create `.rustrank_config.json` in its root:
+
+```json
+{
+  "languages": {
+    "enabled": ["python", "rust", "cpp"],
+    "overrides": [
+      { "paths": ["include/**/*.h"], "language": "cpp" }
+    ]
+  },
+  "excludes": {
+    "paths": ["generated/**", "vendor/**"],
+    "extensions": ["sqlite", ".bin"]
+  }
+}
+```
+
+- Missing or empty `languages.enabled` means auto-detect supported languages. Invalid names are reported during indexing; if none are valid, detection is used.
+- Path overrides are checked before extension mapping; the first matching rule wins. Use them for C++ headers named `.h`, which otherwise default to C.
+- Custom excludes extend the defaults. Root-level `.git`, `.rustrank`, `target`, `node_modules`, `dist`, `build`, `.venv`, `venv`, and `.pytest_cache` are excluded, along with `__pycache__` directories and common binary/archive extensions.
+- MCP `get_config` reads this file. `set_config` writes a JSON value at a dotted key, such as `languages.enabled`. It does not rebuild the index.
+
+### Optional embedding endpoint
+
+Set these variables in the **RustRank server process** before starting it:
+
+| Variable | Requirement | Meaning |
+| --- | --- | --- |
+| `RUSTRANK_EMBEDDING_BASE_URL` | Required for embeddings | HTTP(S) API base, for example `https://api.example.com/v1`. RustRank appends `/embeddings`. |
+| `RUSTRANK_EMBEDDING_MODEL` | Required for embeddings | Model identifier accepted by that endpoint. |
+| `RUSTRANK_EMBEDDING_DIMS` | Required for embeddings | Positive integer matching the returned vector dimensions. |
+| `RUSTRANK_EMBEDDING_API_KEY` | Optional | Bearer token. Unset or blank sends no Authorization header. |
+
+For a shell-launched server:
+
+```bash
+export RUSTRANK_EMBEDDING_BASE_URL=https://api.example.com/v1
+export RUSTRANK_EMBEDDING_MODEL=your-embedding-model
+export RUSTRANK_EMBEDDING_DIMS=1536
+# Supply RUSTRANK_EMBEDDING_API_KEY through your environment if needed.
+./target/release/rustrank
+```
+
+For a client-launched server, add the variables to that client's server `env` configuration. Values above are examples: use your endpoint's actual model and dimensions. The base URL must not contain credentials, a query string, or a fragment.
+
+At startup, RustRank sends a small test embedding request with a **five-second timeout**. It checks HTTP success, response structure, vector dimensions, and finite numeric values. Redirects are not followed. HTTP connections share this startup result.
+
+| Endpoint state | `index_project` | `query` |
+| --- | --- | --- |
+| Validated | Builds the structural index and chunk vectors; `embeddings: false` skips vectors. | Combines text/graph matches with compatible cached chunk vectors. |
+| Missing settings or failed startup check | Builds the structural index, warns, and skips embeddings. | Uses text and graph matching. |
+| Request fails after startup | Reports embedding failures in indexing warnings. | Falls back to text and graph matching if the query embedding fails. |
+
+Correct the endpoint/settings and **restart RustRank** to retry startup validation. Other tools remain available throughout.
+
+Source is split at function boundaries; oversized functions and module-level text are split further into chunks of at most **4,096 UTF-8 bytes and 80 lines**. These are byte/line limits, not model-specific token guarantees. Semantic results retain the matching file, symbol where available, and starting line.
+
+Cached vectors are matched to their source content, endpoint, model, and dimensions. Changed/deleted files and incompatible or legacy whole-file vectors are ignored. **Re-index after upgrading from whole-file embeddings.** Old vector files can remain on disk without affecting results.
+
+When embeddings are enabled, source chunks and query text are sent to the configured endpoint. API keys are not written to the embedding cache.
+
+### HTTP environment reference
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `RUSTRANK_TRANSPORT` | `stdio` | `http`, `streamable_http`, or `streamable-http` select HTTP. Other values select stdio. |
+| `RUSTRANK_LISTEN_ADDR` | Unset | Full IP socket address, such as `127.0.0.1:63477`; overrides host/port. |
+| `RUSTRANK_HOST` | `127.0.0.1` | Bind IP address, not a DNS hostname. Docker defaults to `0.0.0.0`. |
+| `RUSTRANK_PORT` | `63477` | Used when the full listen address is unset. |
+| `RUSTRANK_MCP_PATH` | `/mcp` | Leading slash is added and trailing slashes removed; `/` and `/healthz` are rejected. |
+| `RUSTRANK_ALLOWED_HOSTS` | Loopback and bound address values | Comma-separated hostnames/IPs/authorities added to the allowed list. |
+| `RUSTRANK_ALLOWED_ORIGINS` | Unset | Comma-separated allowed origins; empty disables Origin validation. |
+| `RUSTRANK_DISABLE_HOST_CHECK` | `false` | `true`, `1`, `yes`, or `on` disable host checks. |
+
+Legacy `RUSTANK_*` spellings are accepted for transport/HTTP variables, not embedding variables. RustRank's current diagnostics are written directly to stderr; `RUST_LOG` does not configure a RustRank logging filter.
+
+## Standalone CLI
+
+The CLI indexes repositories without an MCP client:
+
+```bash
+./target/release/rustrank index-project \
+  --repo-path /absolute/path/to/repo \
+  --languages python,rust \
+  --force-rebuild \
+  --clean-stale
+```
+
+| Option | Effect |
+| --- | --- |
+| `--repo-path PATH` | Required repository directory. |
+| `--languages LIST` | Comma-separated language names; omit to use repository settings/detection. |
+| `--force-rebuild` | Rebuild structural file facts even when hashes match. Does not force embedding vectors to regenerate. |
+| `--clean-stale` | Remove obsolete structural cache entries; does not remove old embedding vectors. |
+| `--embeddings` | Enable vector generation for this run. |
+| `--embedding-base-url URL` | Override the embedding API base. |
+| `--embedding-model MODEL` | Override the model. |
+| `--embedding-dims N` | Override vector dimensions. |
+| `--embedding-api-key KEY` | Supply optional bearer authentication. |
+
+CLI embedding precedence is **explicit flags → repository `embeddings` settings → defaults**. Repository keys are `enabled`, `base_url`, `model`, and `dimensions`; repository-stored API keys are not read. The CLI does not consume the MCP embedding environment variables.
+
+Defaults are embeddings disabled, base `https://api.phrk.org/v1`, model `text-image-embedding`, and 1,536 dimensions. Set your own endpoint details explicitly when enabling CLI embeddings:
+
+```bash
+./target/release/rustrank index-project \
+  --repo-path /absolute/path/to/repo \
+  --embeddings \
+  --embedding-base-url https://api.example.com/v1 \
+  --embedding-model your-embedding-model \
+  --embedding-dims 1536
+```
+
+Use `--help`, `index-project --help`, or `--list-tools` to inspect the binary's interface. The CLI returns a JSON indexing summary; MCP tool names such as `query` are not CLI subcommands.
+
+## Docker setup
+
+Build the image from this checkout:
 
 ```bash
 docker build -t rustrank:local .
-
-fixture_dir="$(mktemp -d)"
-chmod 0777 "$fixture_dir"
-
-docker run -d --rm \
-  --name rustrank-smoke \
-  -p 127.0.0.1:63477:63477 \
-  -v "$fixture_dir:/workspace/fixture" \
-  rustrank:local
-
-python3 scripts/smoke_http_json.py \
-  --url http://127.0.0.1:63477/mcp \
-  --fixture-dir "$fixture_dir" \
-  --repo-path /workspace/fixture
-
-docker stop rustrank-smoke
-rm -rf "$fixture_dir"
 ```
 
-## Release Signals
+Run HTTP against a repository mounted at `/workspace/repo`. This Linux example uses your UID/GID so RustRank can write the bind-mounted index:
 
-The Forgejo release workflow runs automatically when a push to the default branch changes the application version. Manual runs offer `Major` (increment the middle component), `minor` (increment the final component), and `retry` (publish the current version). It installs Rust 1.98.1 plus `clippy` and `rustfmt`, then runs:
+```bash
+docker run --rm --name rustrank \
+  --user "$(id -u):$(id -g)" \
+  -p 127.0.0.1:63477:63477 \
+  -v "/absolute/path/to/repo:/workspace/repo" \
+  rustrank:local
+```
+
+Connect to `http://127.0.0.1:63477/mcp` and pass **`/workspace/repo`** as `repo_path`. Without `--user`, the image runs as UID **10001**; give that user write access when using the default identity. Indexing and `set_config` require a writable repository mount.
+
+The image defaults to HTTP on `0.0.0.0:63477`, uses `/workspace` as its working directory, and provides a `/healthz` health check. For stdio, use `-i -e RUSTRANK_TRANSPORT=stdio` and omit the published port.
+
+To enable embeddings, pass the configured variables into the container:
+
+```text
+-e RUSTRANK_EMBEDDING_BASE_URL
+-e RUSTRANK_EMBEDDING_MODEL
+-e RUSTRANK_EMBEDDING_DIMS
+-e RUSTRANK_EMBEDDING_API_KEY
+```
+
+The endpoint must be reachable **from inside the container**. This repository includes a Dockerfile; the current release workflow publishes binary archives, not container images.
+
+## Tools and resources
+
+The server advertises its name `rustrank`, display title **RustRank**, package version, description, GitHub website, usage instructions, and embedded PNG icon. Clients decide which metadata they display.
+
+| Tool | Use it for |
+| --- | --- |
+| `index_project` | Build/refresh structural indexes, optional chunk vectors, and agent guidance. |
+| `query` | Rank relevant modules, symbols, and source chunks using text, graph, and optional semantic signals. |
+| `context` | Inspect a symbol's definition, callers/callees, imports, and related resources. |
+| `impact` | Estimate upstream/downstream dependencies affected by a symbol or module change. |
+| `detect_changes` | Map **unstaged tracked-file** changes to symbols and affected code. |
+| `contextual_search` | Find literal text or regex matches with surrounding lines. |
+| `smart_code_search` | Rank source matches by module importance; `num_context_lines` caps results. |
+| `api_usage` | Locate examples of an API, function, method, or identifier. |
+| `coderank_analysis` | Rank modules using import-graph PageRank. |
+| `code_hotspots` | Find connectivity and textual/change-frequency hotspots. |
+| `trace_data_flow` | Find identifier occurrences and classify textual usage patterns. |
+| `trace_feature_impl` | Map feature keywords to files and coarse code layers. |
+| `trace_dep_impact` | Find direct import dependents of a module. |
+| `error_patterns` | Find error-handling patterns, optional antipatterns, and Git history signals. |
+| `perf_bottleneck` | Find simple performance-pattern matches or specified focus strings. |
+| `exec_paths` | Inspect branches, loops, and optional call context inside a function. |
+| `execute_paths` | Compatibility alias for `exec_paths`. |
+| `get_config` | Read repository JSON configuration. |
+| `set_config` | Write a JSON value at a top-level or dotted configuration key. |
+
+Consult your client's `tools/list` schemas for argument names and required fields. Tool execution failures set `isError: true`; successful indexing can still contain warnings, so inspect the returned summary.
+
+Clients supporting MCP resources can read:
+
+```text
+rustrank://repo/current/context
+rustrank://repo/current/schema
+rustrank://repo/current/modules
+rustrank://repo/current/module/{name}
+rustrank://repo/current/processes
+rustrank://repo/current/process/{name}
+```
+
+Successful `index_project` selects the current repository for resources; otherwise they use the server's working directory. The selection is process-wide, so shared clients can change it. Use explicit `repo_path` tool arguments when working across repositories.
+
+## Supported languages
+
+| Language | Config name | Source extensions |
+| --- | --- | --- |
+| Python | `python` | `.py` |
+| Rust | `rust` | `.rs` |
+| C# | `csharp` | `.cs` |
+| TypeScript | `typescript` | `.ts`, `.tsx` |
+| JavaScript | `javascript` | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| C | `c` | `.c`, `.h` |
+| C++ | `cpp` | `.cpp`, `.cc`, `.cxx`, `.c++`, `.hpp`, `.hh`, `.hxx`, `.h++` |
+| Go | `go` | `.go` |
+
+Python uses RustPython/tree-sitter parsing; other supported languages use tree-sitter. Language support provides static source facts, not compiler-level type checking or execution.
+
+## Files RustRank writes
+
+Indexing creates or updates these files under the selected repository:
+
+```text
+.rustrank/index/v1/
+  project_manifest.json
+  languages/<language>/index.json
+  languages/<language>/files/<content-hash>.json
+  embeddings/<chunk-id>.json                  # when vectors are generated
+.rustrank/skills/
+  exploring.md
+  impact-analysis.md
+  debugging.md
+  refactoring.md
+AGENTS.md                                   # generated section only
+```
+
+`set_config` writes `.rustrank_config.json`. Indexing preserves manual `AGENTS.md` content outside the `<!-- rustrank-index:start -->` and `<!-- rustrank-index:end -->` markers.
+
+Structural caches contain relative paths, symbols, imports, namespaces, hashes, graph relationships, and Git freshness information. Embedding caches contain vectors and location/model metadata. They do not store source snippets or embedding API keys. Tools may return source snippets to the MCP client when requested.
+
+Re-index after edits to refresh persisted facts and vectors. `--force-rebuild` rebuilds structural facts; `--clean-stale` removes obsolete structural entries. Legacy or stale vector files are ignored during semantic search rather than automatically removed.
+
+## Definitions
+
+| Term | Meaning in RustRank |
+| --- | --- |
+| **MCP** | The protocol an assistant client uses to discover and call RustRank tools or read resources. |
+| **Structural index** | Parsed source facts: files, definitions, imports, and their relationships. It needs no embedding service. |
+| **Module** | A source file or language namespace represented in the dependency graph. |
+| **Symbol** | A named definition, such as a function, class, or type, with a source location. |
+| **Import graph / PageRank** | A graph of module dependencies and a ranking based on those links; useful for finding central code. |
+| **Embedding** | A numeric vector returned by a model to represent source or query text for similarity comparison. |
+| **Chunk** | A bounded source segment with file/line metadata, usually within a function or module-level text. |
+| **Semantic search** | Matching query and source vectors by similarity, alongside text and graph signals. |
+| **Manifest / shard** | The project-wide index summary / a language-specific portion of the cache. |
+| **Process flow** | A heuristic call chain derived from static code relationships, not a recorded runtime trace. |
+| **Cache hit** | Reuse of compatible cached facts/vectors. The indexing summary's hit/miss counters describe structural file facts. |
+| **Stdio / Streamable HTTP** | MCP over a child process's input/output / MCP through an HTTP endpoint. |
+
+## Troubleshooting and limits
+
+| Symptom | Check |
+| --- | --- |
+| Server appears idle in a terminal | Stdio waits for an MCP client. Use `--help` or `index-project` for CLI operations. |
+| “Embeddings unavailable” or “Embeddings skipped” | Verify the server environment, base URL, model, dimensions, and optional key; restart after correcting them. Structural indexing still works. |
+| HTTP 401/403 from embedding service | Verify the optional API key and endpoint's authorization requirements. |
+| Vector dimension mismatch | Set dimensions supported by the selected model; re-index after changing model/dimensions. |
+| No semantic matches | Confirm startup validation passed, index with embeddings enabled, and re-index edited files. Old whole-file vectors are ignored. |
+| Permission denied while indexing | Check repository permissions and Docker UID/mount settings. |
+| HTTP host rejected | Add the externally visible hostname/authority to `RUSTRANK_ALLOWED_HOSTS`; use an IP address for bind settings. |
+| Client still shows old tool arguments | Rebuild/update the binary the client actually launches, restart it, and refresh/reconnect the client. |
+| Expected files are absent | Check supported extensions, enabled languages, path overrides, excludes, and UTF-8 encoding. |
+
+RustRank's analysis is static and partly heuristic. Call graphs, inferred layers, execution paths, data-flow labels, and performance findings need verification in source; they are not proof of runtime behavior. Large repositories may take time because embedding requests are made sequentially per uncached chunk. Many analysis tools also parse current source rather than reading every result from the persistent cache.
+
+## Development
+
+The Cargo workspace contains one crate in `src/`. Key code is in `context.rs` (parsing), `index.rs` (persistent index), `embedding_chunks.rs` (chunking), `embeddings.rs` (endpoint/cache/scoring), `project_config.rs` (repository settings), and `tools/` (MCP and CLI handlers).
+
+Run the standard Rust checks:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
-cargo build --release --locked -p rustrank
+cargo check --locked --workspace --all-targets
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 ```
 
-After checks and builds pass, the workflow commits synchronized version files, packages the Linux amd64 binary as `RustRank.vVERSION-linux-amd64.tar.gz`, and publishes the release at https://git.phrk.org/pub/RustRank/releases. Publication retries reuse the same version. The workflow requires `RELEASE_TOKEN` and `RELEASE_USER` secrets with repository and release write access.
+[`.githooks/pre-push`](.githooks/pre-push) contains the repository's Rust check sequence. For an HTTP smoke test, start the server as described above, then use Python 3 in another shell:
 
-## Additional Validation
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python scripts/smoke_http_json.py --url http://127.0.0.1:63477/mcp
+```
 
-`README_REAL_REPO_VALIDATION.md` documents optional validation against pinned external C, C++, and Go repositories. Use it after parser, indexing, search, or graph-ranking changes when fixture tests are not enough.
+The script uses Python's standard library. It creates a temporary fixture, checks all 19 tools, and exercises resources. With a configured embedding endpoint it also exercises vector generation; otherwise it checks structural fallback.
 
-Implementation details are summarized in `docs/IMPLEMENTATION.md`; the protocol and behavior spec lives in `docs/SPEC.md`.
+The [Forgejo release workflow](.forgejo/workflows/release.yml) publishes when the application version changes on `main`. Manual choices are `Major` (increment the middle component), `minor` (increment the final component), and `retry` (publish the current version). Its configuration is in [`.forgejo/release.json`](.forgejo/release.json); release notes/artifacts are available on [Releases](https://git.phrk.org/pub/RustRank/releases).
+
+Further implementation and validation material:
+
+- [Implementation notes](docs/IMPLEMENTATION.md)
+- [Protocol and behavior specification](docs/SPEC.md)
+- [Validation against external C/C++/Go repositories](README_REAL_REPO_VALIDATION.md)
