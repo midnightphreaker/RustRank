@@ -15,8 +15,17 @@ struct Client {
 
 impl Client {
     fn start() -> Self {
+        Self::with_env(&[])
+    }
+
+    fn with_env(env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_rustrank"))
             .env("RUSTRANK_TRANSPORT", "stdio")
+            .env_remove("RUSTRANK_EMBEDDING_BASE_URL")
+            .env_remove("RUSTRANK_EMBEDDING_MODEL")
+            .env_remove("RUSTRANK_EMBEDDING_DIMS")
+            .env_remove("RUSTRANK_EMBEDDING_API_KEY")
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -132,10 +141,6 @@ async fn nullable_tool_parameters_use_any_of_instead_of_type_arrays() {
         ("coderank_analysis", "module_prefix", "string"),
         ("contextual_search", "file_type", "string"),
         ("error_patterns", "days_back", "integer"),
-        ("index_project", "embedding_api_key", "string"),
-        ("index_project", "embedding_base_url", "string"),
-        ("index_project", "embedding_dims", "integer"),
-        ("index_project", "embedding_model", "string"),
         ("index_project", "embeddings", "boolean"),
         ("index_project", "languages", "array"),
     ] {
@@ -279,4 +284,232 @@ async fn set_config_preserves_all_json_value_types() {
         assert_eq!(config["compat"], value);
     }
     client.stop().await;
+}
+
+#[tokio::test]
+async fn unavailable_embeddings_keep_index_advertised_and_reject_every_argument_shape() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("example.rs"), "fn main() {}\n").unwrap();
+    let mut client = Client::start();
+    client.initialize().await;
+    client
+        .send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .await;
+    let response = client.receive().await;
+    let tools = response["result"]["tools"].as_array().unwrap();
+    let index = tools.iter().find(|t| t["name"] == "index_project").unwrap();
+    for key in [
+        "embedding_base_url",
+        "embedding_model",
+        "embedding_dims",
+        "embedding_api_key",
+    ] {
+        assert!(
+            index["inputSchema"]["properties"].get(key).is_none(),
+            "{key} still exposed"
+        );
+    }
+    for arguments in [
+        json!({}),
+        json!({"repo_path":42}),
+        json!({"repo_path":repo.path(),"force_rebuild":true,"clean_stale":true,"embeddings":false}),
+        json!({"embedding_api_key":"ignored-secret","embeddings":true}),
+    ] {
+        client.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index_project","arguments":arguments}})).await;
+        let response = client.receive().await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("RUSTRANK_EMBEDDING_BASE_URL"), "{text}");
+        assert!(!text.contains("ignored-secret"));
+    }
+    assert!(!repo.path().join(".rustrank").exists());
+    assert!(!repo.path().join("AGENTS.md").exists());
+    client
+        .send(json!({"jsonrpc":"2.0","id":4,"method":"ping"}))
+        .await;
+    assert_eq!(client.receive().await["result"], json!({}));
+    client.stop().await;
+}
+
+async fn index_call(client: &mut Client, arguments: Value) -> Value {
+    client.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_project","arguments":arguments}})).await;
+    client.receive().await
+}
+
+#[tokio::test]
+async fn invalid_embedding_settings_are_reported_without_stopping_server() {
+    for (settings, expected) in [
+        (
+            vec![("RUSTRANK_EMBEDDING_BASE_URL", "http://127.0.0.1:9/v1")],
+            "RUSTRANK_EMBEDDING_MODEL",
+        ),
+        (
+            vec![
+                ("RUSTRANK_EMBEDDING_BASE_URL", "http://127.0.0.1:9/v1"),
+                ("RUSTRANK_EMBEDDING_MODEL", "test"),
+            ],
+            "RUSTRANK_EMBEDDING_DIMS",
+        ),
+    ] {
+        let mut client = Client::with_env(&settings);
+        client.initialize().await;
+        let result = index_call(&mut client, json!({})).await;
+        assert_eq!(result["result"]["isError"], true);
+        assert!(result.to_string().contains(expected));
+        client.stop().await;
+    }
+    for (url, dims, expected) in [
+        ("http://127.0.0.1:9/v1", "0", "positive integer"),
+        ("http://127.0.0.1:9/v1", "oops", "positive integer"),
+        ("http://127.0.0.1:9/v1", "-1", "positive integer"),
+        ("not-a-url", "3", "valid HTTP(S)"),
+        ("ftp://example.test/v1", "3", "HTTP(S) API base"),
+        (
+            "http://user:do-not-leak@example.test/v1",
+            "3",
+            "without credentials",
+        ),
+        ("http://127.0.0.1:9/v1", "3", "cannot connect"),
+    ] {
+        let mut client = Client::with_env(&[
+            ("RUSTRANK_EMBEDDING_BASE_URL", url),
+            ("RUSTRANK_EMBEDDING_MODEL", "test"),
+            ("RUSTRANK_EMBEDDING_DIMS", dims),
+        ]);
+        client.initialize().await;
+        let result = index_call(&mut client, json!({})).await;
+        assert_eq!(result["result"]["isError"], true, "{result}");
+        assert!(result.to_string().contains(expected), "{result}");
+        assert!(!result.to_string().contains("do-not-leak"));
+        client.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn embedding_probe_rejects_http_errors_invalid_responses_and_wrong_dimensions() {
+    use axum::{Router, http::StatusCode, routing::post};
+    for (status, body, expected) in [
+        (302, r#"{"data":[{"embedding":[1,2,3]}]}"#, "302"),
+        (200, r#"{"data":[{"embedding":[1e100,2,3]}]}"#, "non-finite"),
+        (401, r#"{"error":"do-not-leak"}"#, "401"),
+        (404, r#"{"error":"unknown model"}"#, "404"),
+        (500, "internal error", "500"),
+        (200, "not json", "invalid embedding response"),
+        (200, r#"{"data":[]}"#, "no data"),
+        (200, r#"{"choices":[]}"#, "invalid embedding response"),
+        (
+            200,
+            r#"{"data":[{"embedding":[1,2]}]}"#,
+            "dimension mismatch",
+        ),
+    ] {
+        let app = Router::new().route(
+            "/v1/embeddings",
+            post(move || async move { (StatusCode::from_u16(status).unwrap(), body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut client = Client::with_env(&[
+            ("RUSTRANK_EMBEDDING_BASE_URL", &url),
+            ("RUSTRANK_EMBEDDING_MODEL", "test"),
+            ("RUSTRANK_EMBEDDING_DIMS", "3"),
+            ("RUSTRANK_EMBEDDING_API_KEY", "do-not-leak"),
+        ]);
+        client.initialize().await;
+        let result = index_call(&mut client, json!({"embeddings":false})).await;
+        assert_eq!(result["result"]["isError"], true, "{result}");
+        assert!(result.to_string().contains(expected), "{result}");
+        assert!(!result.to_string().contains("do-not-leak"));
+        client.stop().await;
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn valid_embedding_endpoint_is_probed_once_and_index_uses_environment() {
+    use axum::{Json, Router, http::HeaderMap, routing::post};
+    use std::sync::{Arc, Mutex};
+    for api_key in [None, Some("test-only-key")] {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/v1/embeddings",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push((headers, body));
+                    Json(json!({"data":[{"index":0,"embedding":[0.1,0.2,0.3]}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut env = vec![
+            ("RUSTRANK_EMBEDDING_BASE_URL", url.as_str()),
+            ("RUSTRANK_EMBEDDING_MODEL", "fixture-model"),
+            ("RUSTRANK_EMBEDDING_DIMS", "3"),
+        ];
+        if let Some(key) = api_key {
+            env.push(("RUSTRANK_EMBEDDING_API_KEY", key));
+        }
+        let mut client = Client::with_env(&env);
+        client.initialize().await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "startup must probe before serving"
+        );
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("example.rs"), "pub fn example() {}\n").unwrap();
+        let args = json!({"repo_path":repo.path(),"force_rebuild":false,"clean_stale":false});
+        let result = index_call(&mut client, args.clone()).await;
+        assert_ne!(result["result"]["isError"], true, "{result}");
+        assert!(repo.path().join(".rustrank/index/v1/embeddings").is_dir());
+        let count = requests.lock().unwrap().len();
+        assert!(count > 1, "index must generate embeddings by default");
+        let mut args = args;
+        args["embeddings"] = json!(false);
+        let result = index_call(&mut client, args).await;
+        assert_ne!(result["result"]["isError"], true, "{result}");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            count,
+            "false must skip vector generation"
+        );
+        for (headers, body) in requests.lock().unwrap().iter() {
+            assert_eq!(body["model"], "fixture-model");
+            assert_eq!(body["dimensions"], 3);
+            assert_eq!(
+                headers.get("authorization").map(|v| v.to_str().unwrap()),
+                api_key.map(|_| "Bearer test-only-key")
+            );
+        }
+        client.stop().await;
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn embedding_probe_timeout_still_allows_initialization() {
+    use axum::{Router, routing::post};
+    let app = Router::new().route(
+        "/v1/embeddings",
+        post(|| async { std::future::pending::<String>().await }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut client = Client::with_env(&[
+        ("RUSTRANK_EMBEDDING_BASE_URL", &url),
+        ("RUSTRANK_EMBEDDING_MODEL", "test"),
+        ("RUSTRANK_EMBEDDING_DIMS", "3"),
+    ]);
+    client.initialize().await;
+    let result = index_call(&mut client, json!({})).await;
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    assert!(result.to_string().contains("timed out"), "{result}");
+    client.stop().await;
+    task.abort();
 }

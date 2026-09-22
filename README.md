@@ -135,20 +135,43 @@ Additional excludes can be configured with path globs and extensions:
 }
 ```
 
-Embedding configuration is optional. It can be provided in `.rustrank_config.json` or through `index_project`/`index-project` request arguments:
+### MCP embedding endpoint
 
-```json
-{
-  "embeddings": {
-    "enabled": true,
-    "base_url": "https://api.example.com/v1",
-    "model": "text-image-embedding",
-    "dimensions": 1536
-  }
-}
+Configure the MCP server process before starting RustRank:
+
+```bash
+export RUSTRANK_EMBEDDING_BASE_URL=https://api.example.com/v1
+export RUSTRANK_EMBEDDING_MODEL=your-embedding-model
+export RUSTRANK_EMBEDDING_DIMS=1536
+# Optional: set RUSTRANK_EMBEDDING_API_KEY in the server environment if required.
 ```
 
-The embedding client calls the configured base URL with an `/embeddings` suffix, caches vectors by source content hash, and uses cached embeddings in the `query` tool when enabled. API keys are request options, not written into config examples.
+The base URL, model and positive integer dimensions are required for the MCP
+`index_project` tool to execute. The key is optional; unset or blank means no
+Authorization header. These four settings are no longer tool arguments and
+repository configuration cannot override them for MCP indexing. Pass the
+variables to the server process in your MCP client's environment settings, or
+with Docker `-e` options.
+
+At startup RustRank sends a small test input to `<base_url>/embeddings`, with a
+five-second request timeout. It checks HTTP success, the embedding response and
+vector dimensions. Missing/invalid settings, connection or authentication
+failures, unsupported models/endpoints, and malformed or mismatched vectors are
+logged to stderr as a debug diagnostic. RustRank continues serving every tool.
+`index_project` remains listed, but every call returns the saved problem with
+`isError: true` and performs no indexing, regardless of its arguments. Correct
+the server environment or endpoint and restart RustRank to recheck it. HTTP
+client connections reuse the startup result rather than probing again.
+
+After successful validation, `index_project` generates embeddings by default;
+`embeddings: false` skips vector generation for that call, but does not bypass
+startup validation. Vectors are cached by source content hash. Later endpoint
+failures during indexing are reported in the existing per-file warnings.
+
+The standalone `index-project` CLI retains its embedding flags and optional
+repository configuration. `query` retains its repository-based semantic-search
+configuration (`embeddings.enabled`, `base_url`, `model`, and `dimensions`);
+the server environment migration here applies to MCP indexing.
 
 ## CLI
 
@@ -398,7 +421,7 @@ In another shell, run the no-SSE Streamable HTTP smoke test:
 python3 scripts/smoke_http_json.py --url http://127.0.0.1:63477/mcp
 ```
 
-The smoke script creates a temporary multi-language fixture, initializes MCP, verifies the tool list, calls `index_project`, exercises resources, calls each expected tool, and checks that an embedding API key is not echoed in the tool response.
+The smoke script requires a server started with the valid embedding environment above. It creates a temporary multi-language fixture, initializes MCP, verifies the tool list, calls `index_project` with and without vector generation, exercises resources, and calls each expected tool. Startup failures and optional authentication are covered by the Rust MCP compatibility tests.
 
 For Docker smoke testing:
 

@@ -46,6 +46,53 @@ pub struct EmbeddingConfig {
     pub api_key: Option<String>,
 }
 
+/// Resolve server-owned settings without repository defaults, then test a real embedding.
+pub fn validated_server_config() -> std::result::Result<EmbeddingConfig, String> {
+    let required = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| non_empty(Some(value)))
+            .ok_or_else(|| format!("{name} is missing or empty"))
+    };
+    let base_url = required("RUSTRANK_EMBEDDING_BASE_URL")?;
+    let model = required("RUSTRANK_EMBEDDING_MODEL")?;
+    let dimensions = required("RUSTRANK_EMBEDDING_DIMS")?
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or("RUSTRANK_EMBEDDING_DIMS must be a positive integer")?;
+    let url = reqwest::Url::parse(&base_url)
+        .map_err(|_| "RUSTRANK_EMBEDDING_BASE_URL must be a valid HTTP(S) URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("RUSTRANK_EMBEDDING_BASE_URL must be an HTTP(S) API base URL without credentials, query or fragment".into());
+    }
+    let config = EmbeddingConfig {
+        enabled: true,
+        base_url,
+        model,
+        dimensions,
+        api_key: non_empty(std::env::var("RUSTRANK_EMBEDDING_API_KEY").ok()),
+    };
+    let vector = fetch_embedding(&config, "RustRank startup embedding check")
+        .map_err(|err| err.to_string())?;
+    if vector.len() != dimensions {
+        return Err(format!(
+            "embedding dimension mismatch: RUSTRANK_EMBEDDING_DIMS specifies {dimensions}, endpoint returned {}",
+            vector.len()
+        ));
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err("embedding endpoint returned non-finite vector values".into());
+    }
+    Ok(config)
+}
+
 impl std::fmt::Debug for EmbeddingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmbeddingConfig")
@@ -286,6 +333,7 @@ fn fetch_embedding_blocking(config: &EmbeddingConfig, input: &str) -> Result<Vec
     let url = format!("{}/embeddings", config.base_url.trim_end_matches('/'));
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| AppError::Context(err.to_string()))?;
     let mut request = client.post(url).json(&serde_json::json!({
@@ -296,14 +344,25 @@ fn fetch_embedding_blocking(config: &EmbeddingConfig, input: &str) -> Result<Vec
     if let Some(api_key) = config.api_key.as_deref().filter(|value| !value.is_empty()) {
         request = request.bearer_auth(api_key);
     }
-    let response = request
-        .send()
-        .map_err(|err| AppError::Context(err.to_string()))?
-        .error_for_status()
-        .map_err(|err| AppError::Context(err.to_string()))?;
+    let response = request.send().map_err(|err| {
+        let problem = if err.is_timeout() {
+            "embedding endpoint timed out after 5 seconds"
+        } else if err.is_connect() {
+            "cannot connect to embedding endpoint (check address, DNS, TLS and reachability)"
+        } else {
+            "embedding request failed (check endpoint and authentication settings)"
+        };
+        AppError::Context(problem.into())
+    })?;
+    if !response.status().is_success() {
+        return Err(AppError::Context(format!(
+            "embedding endpoint returned HTTP {} (check endpoint, model and authentication)",
+            response.status()
+        )));
+    }
     let body = response
         .json::<EmbeddingResponse>()
-        .map_err(|err| AppError::Context(err.to_string()))?;
+        .map_err(|_| AppError::Validation("invalid embedding response: expected JSON data[].embedding containing numeric vector values".into()))?;
     body.data
         .into_iter()
         .next()

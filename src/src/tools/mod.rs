@@ -9,7 +9,7 @@ pub mod trace;
 
 use std::{future::Future, net::SocketAddr};
 
-use crate::embeddings::EmbeddingOptions;
+use crate::embeddings::{EmbeddingConfig, EmbeddingOptions};
 use axum::routing::get;
 use base64::Engine;
 use clap::{Parser, Subcommand, error::ErrorKind};
@@ -61,12 +61,20 @@ pub const ALL_TOOLS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct RustRankRouter {
     tool_router: ToolRouter<Self>,
+    embedding_config: Result<EmbeddingConfig, String>,
 }
 
 impl RustRankRouter {
     pub fn new() -> Self {
+        let embedding_config = crate::embeddings::validated_server_config().map_err(|problem| {
+            format!("index_project unavailable: {problem}. Configure RUSTRANK_EMBEDDING_BASE_URL, RUSTRANK_EMBEDDING_MODEL and RUSTRANK_EMBEDDING_DIMS (RUSTRANK_EMBEDDING_API_KEY is optional), then restart RustRank.")
+        });
+        if let Err(problem) = &embedding_config {
+            eprintln!("RustRank DEBUG: {problem}");
+        }
         Self {
             tool_router: Self::tool_router(),
+            embedding_config,
         }
     }
 }
@@ -199,7 +207,7 @@ fn nullable_schema<T: schemars::JsonSchema>(
     schemars::json_schema!({"anyOf": [generator.subschema_for::<T>(), {"type": "null"}]})
 }
 
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct IndexProjectRequest {
     repo_path: String,
     #[schemars(default, schema_with = "nullable_schema::<Vec<String>>")]
@@ -209,18 +217,6 @@ struct IndexProjectRequest {
     #[serde(default)]
     #[schemars(schema_with = "nullable_schema::<bool>")]
     embeddings: Option<bool>,
-    #[serde(default)]
-    #[schemars(schema_with = "nullable_schema::<String>")]
-    embedding_base_url: Option<String>,
-    #[serde(default)]
-    #[schemars(schema_with = "nullable_schema::<String>")]
-    embedding_model: Option<String>,
-    #[serde(default)]
-    #[schemars(schema_with = "nullable_schema::<usize>")]
-    embedding_dims: Option<usize>,
-    #[serde(default)]
-    #[schemars(schema_with = "nullable_schema::<String>")]
-    embedding_api_key: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -282,41 +278,6 @@ struct IndexProjectCli {
     embedding_api_key: Option<String>,
 }
 
-impl From<IndexProjectCli> for IndexProjectRequest {
-    fn from(cli: IndexProjectCli) -> Self {
-        Self {
-            repo_path: cli.repo_path,
-            languages: (!cli.languages.is_empty()).then_some(cli.languages),
-            force_rebuild: cli.force_rebuild,
-            clean_stale: cli.clean_stale,
-            embeddings: cli.embeddings.then_some(true),
-            embedding_base_url: cli.embedding_base_url,
-            embedding_model: cli.embedding_model,
-            embedding_dims: cli.embedding_dims,
-            embedding_api_key: cli.embedding_api_key,
-        }
-    }
-}
-
-impl std::fmt::Debug for IndexProjectRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IndexProjectRequest")
-            .field("repo_path", &self.repo_path)
-            .field("languages", &self.languages)
-            .field("force_rebuild", &self.force_rebuild)
-            .field("clean_stale", &self.clean_stale)
-            .field("embeddings", &self.embeddings)
-            .field("embedding_base_url", &self.embedding_base_url)
-            .field("embedding_model", &self.embedding_model)
-            .field("embedding_dims", &self.embedding_dims)
-            .field(
-                "embedding_api_key",
-                &self.embedding_api_key.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ContextRequest {
     repo_path: String,
@@ -342,9 +303,13 @@ struct QueryRequest {
 #[tool_router]
 impl RustRankRouter {
     #[tool(
-        description = "Build or refresh repository indexes before exploration or after source changes. Writes .rustrank caches/workflow guides and the generated AGENTS.md section, and selects this repo for MCP resources. Returns per-language counts, cache statistics and warnings. Embeddings may contact the configured API; clean_stale removes obsolete cache entries."
+        description = "Build or refresh repository indexes and generated AGENTS.md guidance. Requires an embedding endpoint validated at server startup via RUSTRANK_EMBEDDING_* environment variables; otherwise returns the startup problem without writing files. Embeddings default on; false skips vector generation after successful validation. Returns counts, cache statistics and warnings; clean_stale removes obsolete entries."
     )]
     fn index_project(&self, Parameters(req): Parameters<IndexProjectRequest>) -> CallToolResult {
+        let config = match &self.embedding_config {
+            Ok(config) => config,
+            Err(problem) => return json::<()>(Err(crate::AppError::Context(problem.clone()))),
+        };
         let repo_path = req.repo_path.clone();
         let result = crate::index::index_project_with_embeddings(
             &req.repo_path,
@@ -352,11 +317,11 @@ impl RustRankRouter {
             req.force_rebuild,
             req.clean_stale,
             EmbeddingOptions {
-                enabled: req.embeddings,
-                base_url: req.embedding_base_url,
-                model: req.embedding_model,
-                dimensions: req.embedding_dims,
-                api_key: req.embedding_api_key,
+                enabled: Some(req.embeddings.unwrap_or(true)),
+                base_url: Some(config.base_url.clone()),
+                model: Some(config.model.clone()),
+                dimensions: Some(config.dimensions),
+                api_key: config.api_key.clone(),
             },
         );
         if result.is_ok()
@@ -561,6 +526,21 @@ impl RustRankRouter {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RustRankRouter {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Check availability before deserializing arguments, including incomplete/stale calls.
+        if request.name == "index_project"
+            && let Err(problem) = &self.embedding_config
+        {
+            return Ok(json::<()>(Err(crate::AppError::Context(problem.clone()))));
+        }
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(call).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -662,28 +642,29 @@ pub fn serve() -> anyhow::Result<()> {
         }
 
         if let Some(Commands::IndexProject(req)) = cli.command {
-            return run_index_project_cli(req.into());
+            return run_index_project_cli(req);
         }
     }
 
+    let router = RustRankRouter::new();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         match transport_from_env() {
-            Transport::StreamableHttp => serve_streamable_http().await,
-            Transport::Stdio => serve_stdio().await,
+            Transport::StreamableHttp => serve_streamable_http(router).await,
+            Transport::Stdio => serve_stdio(router).await,
         }
     })
 }
 
-fn run_index_project_cli(req: IndexProjectRequest) -> anyhow::Result<()> {
+fn run_index_project_cli(req: IndexProjectCli) -> anyhow::Result<()> {
     let repo_path = req.repo_path.clone();
     let response = crate::index::index_project_with_embeddings(
         &req.repo_path,
-        req.languages,
+        (!req.languages.is_empty()).then_some(req.languages),
         req.force_rebuild,
         req.clean_stale,
         EmbeddingOptions {
-            enabled: req.embeddings,
+            enabled: req.embeddings.then_some(true),
             base_url: req.embedding_base_url,
             model: req.embedding_model,
             dimensions: req.embedding_dims,
@@ -750,17 +731,17 @@ fn transport_from_value(value: Option<&str>) -> Transport {
     }
 }
 
-async fn serve_stdio() -> anyhow::Result<()> {
+async fn serve_stdio(router: RustRankRouter) -> anyhow::Result<()> {
     let (read, write) = rmcp::transport::stdio();
     let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write);
-    let service = RustRankRouter::new()
+    let service = router
         .serve(compat::LegacyDiscoveryTransport(transport))
         .await?;
     service.waiting().await?;
     Ok(())
 }
 
-async fn serve_streamable_http() -> anyhow::Result<()> {
+async fn serve_streamable_http(router: RustRankRouter) -> anyhow::Result<()> {
     let http_config = HttpRuntimeConfig::from_env()?;
     let server_config =
         streamable_http_server_config(http_config.allowed_hosts, http_config.allowed_origins);
@@ -771,7 +752,7 @@ async fn serve_streamable_http() -> anyhow::Result<()> {
     };
     let service: StreamableHttpService<RustRankRouter, LocalSessionManager> =
         StreamableHttpService::new(
-            || Ok(RustRankRouter::new()),
+            move || Ok(router.clone()),
             Default::default(),
             server_config,
         );

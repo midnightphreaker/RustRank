@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import http.server
 import json
 import subprocess
 import sys
 import tempfile
-import threading
 import textwrap
 from pathlib import Path
 from urllib import error, request
@@ -41,37 +39,6 @@ EXPECTED_TOOLS = [
 
 class SmokeFailure(RuntimeError):
     pass
-
-
-class EmbeddingHandler(http.server.BaseHTTPRequestHandler):
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length)
-        try:
-            payload = json.loads(body.decode("utf-8"))
-            dims = int(payload.get("dimensions", 3))
-        except (ValueError, json.JSONDecodeError):
-            dims = 3
-
-        vector = [0.0] * max(dims, 1)
-        vector[0] = 1.0
-        response = json.dumps({"data": [{"embedding": vector}]}).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
-
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-
-def start_embedding_server() -> tuple[http.server.ThreadingHTTPServer, str]:
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), EmbeddingHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    host, port = server.server_address
-    return server, f"http://{host}:{port}/v1"
 
 
 def write_file(path: Path, content: str) -> None:
@@ -616,6 +583,7 @@ def run_smoke(url: str, repo_path: str, fixture_dir: Path | None = None) -> None
             "languages": None,
             "force_rebuild": True,
             "clean_stale": True,
+            "embeddings": False,
         },
     )
     request_id += 1
@@ -639,30 +607,19 @@ def run_smoke(url: str, repo_path: str, fixture_dir: Path | None = None) -> None
         ):
             raise SmokeFailure("index_project AGENTS.md section is missing or malformed")
 
-    embedding_server, embedding_base_url = start_embedding_server()
-    try:
-        embedding_result = call_tool_json(
-            url,
-            request_id,
-            "index_project",
-            {
-                "repo_path": repo_path,
-                "languages": None,
-                "force_rebuild": False,
-                "clean_stale": True,
-                "embeddings": True,
-                "embedding_base_url": embedding_base_url,
-                "embedding_model": "smoke-embedding-model",
-                "embedding_dims": 3,
-                "embedding_api_key": "smoke-secret-api-key",
-            },
-        )
-    finally:
-        embedding_server.shutdown()
-        embedding_server.server_close()
+    call_tool_json(
+        url,
+        request_id,
+        "index_project",
+        {
+            "repo_path": repo_path,
+            "languages": None,
+            "force_rebuild": False,
+            "clean_stale": True,
+            "embeddings": True,
+        },
+    )
     request_id += 1
-    if "smoke-secret-api-key" in json.dumps(embedding_result):
-        raise SmokeFailure("index_project embedding API key leaked into tool response")
 
     request_id = exercise_resources(url, request_id)
 
