@@ -11,14 +11,15 @@ use std::{future::Future, net::SocketAddr};
 
 use crate::embeddings::EmbeddingOptions;
 use axum::routing::get;
+use base64::Engine;
 use clap::{Parser, Subcommand, error::ErrorKind};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, ListResourceTemplatesResult, ListResourcesResult,
-        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
-        ServerCapabilities, ServerInfo,
+        CallToolResult, Content, Icon, Implementation, ListResourceTemplatesResult,
+        ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+        ResourceContents, ServerCapabilities, ServerInfo,
     },
     schemars,
     service::{RequestContext, RoleServer},
@@ -567,11 +568,26 @@ impl ServerHandler for RustRankRouter {
                 .enable_resources()
                 .build(),
         )
-        .with_server_info(Implementation::new(
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .with_instructions("RustRank repository analysis tools")
+        .with_server_info(
+            Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                .with_title("RustRank")
+                .with_description(
+                    "Repository analysis for LLMs: source indexing, code search, import-graph ranking, symbol context and change-impact inspection across supported languages.",
+                )
+                .with_website_url("https://github.com/midnightphreaker/RustRank")
+                .with_icons(vec![
+                    Icon::new(format!(
+                        "data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode(include_bytes!("../assets/rustrank.png")),
+                    ))
+                    .with_mime_type("image/png")
+                    .with_sizes(vec!["256x256".to_owned()]),
+                ]),
+        )
+        .with_instructions(
+            "Use repo_path for the repository directory on the server. Start with query to locate relevant code, context to inspect a symbol, and impact before changing shared code. Use contextual_search for literal or regex matches; detect_changes reviews unstaged tracked-file edits. index_project writes repository-local caches and generated guidance and selects the repo for MCP resources; set_config writes repository configuration. Embedding-enabled operations may call the configured API. Analysis is static and partly heuristic: verify findings in source. Tool results contain JSON text; execution failures set isError.",
+        )
     }
 
     fn list_resources(

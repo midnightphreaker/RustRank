@@ -1866,6 +1866,7 @@ version = "0.1.13"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "blake3",
  "clap",
  "git2",

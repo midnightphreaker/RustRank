@@ -191,6 +191,42 @@ async fn initialize_identifies_rustrank_not_its_sdk() {
     let info = rmcp::ServerHandler::get_info(&rustrank::tools::RustRankRouter::new());
     assert_eq!(info.server_info.name, "rustrank");
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(info.server_info.title.as_deref(), Some("RustRank"));
+    assert_eq!(
+        info.server_info.website_url.as_deref(),
+        Some("https://github.com/midnightphreaker/RustRank")
+    );
+    assert!(
+        info.server_info
+            .description
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+    );
+    let instructions = info.instructions.as_deref().unwrap();
+    assert!(instructions.contains("query"));
+    assert!(instructions.contains("index_project"));
+    assert!(instructions.contains("set_config"));
+    let icons = info
+        .server_info
+        .icons
+        .as_ref()
+        .expect("server icon metadata");
+    assert_eq!(icons.len(), 1);
+    assert_eq!(icons[0].mime_type.as_deref(), Some("image/png"));
+    assert_eq!(
+        icons[0].sizes.as_deref(),
+        Some(["256x256".to_owned()].as_slice())
+    );
+    assert!(icons[0].src.starts_with("data:image/png;base64,"));
+    use base64::Engine;
+    let encoded = icons[0].src.strip_prefix("data:image/png;base64,").unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    assert_eq!(bytes, include_bytes!("../src/assets/rustrank.png"));
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 256);
+    assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 256);
 }
 
 #[tokio::test]
