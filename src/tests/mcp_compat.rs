@@ -120,6 +120,73 @@ async fn advertised_tool_properties_are_dictionary_schemas() {
 }
 
 #[tokio::test]
+async fn nullable_tool_parameters_use_any_of_instead_of_type_arrays() {
+    let mut client = Client::start();
+    client.initialize().await;
+    client
+        .send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .await;
+    let response = client.receive().await;
+    let tools = response["result"]["tools"].as_array().unwrap();
+    for (tool_name, field, expected_type) in [
+        ("coderank_analysis", "module_prefix", "string"),
+        ("contextual_search", "file_type", "string"),
+        ("error_patterns", "days_back", "integer"),
+        ("index_project", "embedding_api_key", "string"),
+        ("index_project", "embedding_base_url", "string"),
+        ("index_project", "embedding_dims", "integer"),
+        ("index_project", "embedding_model", "string"),
+        ("index_project", "embeddings", "boolean"),
+        ("index_project", "languages", "array"),
+    ] {
+        let tool = tools.iter().find(|t| t["name"] == tool_name).unwrap();
+        let schema = &tool["inputSchema"]["properties"][field];
+        assert!(
+            schema.get("type").is_none(),
+            "{tool_name}.{field}: {schema}"
+        );
+        let branches = schema["anyOf"]
+            .as_array()
+            .expect("explicit nullable alternatives");
+        assert!(branches.iter().any(|s| s["type"] == expected_type));
+        assert!(branches.iter().any(|s| s["type"] == "null"));
+        assert!(
+            !tool["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field))
+        );
+    }
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn config_value_schema_explicitly_advertises_all_json_types() {
+    let mut client = Client::start();
+    client.initialize().await;
+    client
+        .send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .await;
+    let response = client.receive().await;
+    let tool = response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "set_config")
+        .unwrap();
+    let branches = tool["inputSchema"]["properties"]["value"]["anyOf"]
+        .as_array()
+        .expect("config values must explicitly advertise supported JSON types");
+    for kind in ["null", "boolean", "number", "string", "array", "object"] {
+        assert!(
+            branches.iter().any(|schema| schema["type"] == kind),
+            "missing {kind}"
+        );
+    }
+    client.stop().await;
+}
+
+#[tokio::test]
 async fn initialize_identifies_rustrank_not_its_sdk() {
     let info = rmcp::ServerHandler::get_info(&rustrank::tools::RustRankRouter::new());
     assert_eq!(info.server_info.name, "rustrank");

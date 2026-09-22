@@ -80,6 +80,7 @@ impl Default for RustRankRouter {
 struct ContextualSearchRequest {
     path: String,
     pattern: String,
+    #[schemars(default, schema_with = "nullable_schema::<String>")]
     file_type: Option<String>,
     is_regex: bool,
     num_context_lines: usize,
@@ -105,6 +106,7 @@ struct ApiUsageRequest {
 struct CodeRankRequest {
     repo_path: String,
     top_n: usize,
+    #[schemars(default, schema_with = "nullable_schema::<String>")]
     module_prefix: Option<String>,
     external_modules: bool,
 }
@@ -141,6 +143,7 @@ struct ErrorPatternsRequest {
     repo_path: String,
     include_antipatterns: bool,
     show_evolution: bool,
+    #[schemars(default, schema_with = "nullable_schema::<u32>")]
     days_back: Option<u32>,
 }
 
@@ -173,26 +176,49 @@ struct SetConfigRequest {
 }
 
 fn config_value_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    // Object-form schemas work with clients whose MCP models reject boolean schemas.
-    // Like `true`, this accepts every JSON value, including null and arrays.
-    schemars::json_schema!({"description": "Configuration value (any JSON value)"})
+    // Enumerate all JSON types instead of a boolean or unconstrained schema.
+    // `number` includes integers; arrays and objects remain free-form.
+    schemars::json_schema!({
+        "description": "Configuration value (any JSON value)",
+        "anyOf": [
+            {"type": "null"},
+            {"type": "boolean"},
+            {"type": "number"},
+            {"type": "string"},
+            {"type": "array"},
+            {"type": "object", "additionalProperties": true}
+        ]
+    })
+}
+
+fn nullable_schema<T: schemars::JsonSchema>(
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    // Preserve T's constraints and nullability without the less portable type array.
+    schemars::json_schema!({"anyOf": [generator.subschema_for::<T>(), {"type": "null"}]})
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct IndexProjectRequest {
     repo_path: String,
+    #[schemars(default, schema_with = "nullable_schema::<Vec<String>>")]
     languages: Option<Vec<String>>,
     force_rebuild: bool,
     clean_stale: bool,
     #[serde(default)]
+    #[schemars(schema_with = "nullable_schema::<bool>")]
     embeddings: Option<bool>,
     #[serde(default)]
+    #[schemars(schema_with = "nullable_schema::<String>")]
     embedding_base_url: Option<String>,
     #[serde(default)]
+    #[schemars(schema_with = "nullable_schema::<String>")]
     embedding_model: Option<String>,
     #[serde(default)]
+    #[schemars(schema_with = "nullable_schema::<usize>")]
     embedding_dims: Option<usize>,
     #[serde(default)]
+    #[schemars(schema_with = "nullable_schema::<String>")]
     embedding_api_key: Option<String>,
 }
 
