@@ -341,7 +341,7 @@ struct QueryRequest {
 #[tool_router]
 impl RustRankRouter {
     #[tool(
-        description = "Index a repository into persistent per-language caches and a project manifest"
+        description = "Build or refresh repository indexes before exploration or after source changes. Writes .rustrank caches/workflow guides and the generated AGENTS.md section, and selects this repo for MCP resources. Returns per-language counts, cache statistics and warnings. Embeddings may contact the configured API; clean_stale removes obsolete cache entries."
     )]
     fn index_project(&self, Parameters(req): Parameters<IndexProjectRequest>) -> CallToolResult {
         let repo_path = req.repo_path.clone();
@@ -366,7 +366,9 @@ impl RustRankRouter {
         json(result)
     }
 
-    #[tool(description = "Search repository files for a pattern with line context")]
+    #[tool(
+        description = "Find literal text or regex matches under a directory. Returns file paths, 1-based line numbers, matching lines and surrounding context. file_type accepts an extension such as rs or .py; omit it to search enabled source languages. Respects configured exclusions."
+    )]
     fn contextual_search(
         &self,
         Parameters(req): Parameters<ContextualSearchRequest>,
@@ -380,7 +382,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Search code and rank results by module importance")]
+    #[tool(
+        description = "Find literal text in supported source files, ranked by import-graph PageRank. Returns matching lines, file paths, surrounding context and scores. Use contextual_search for regex or extension filtering. context_lines sets context per match; num_context_lines caps the number of results, with a minimum of one."
+    )]
     fn smart_code_search(
         &self,
         Parameters(req): Parameters<SmartCodeSearchRequest>,
@@ -393,7 +397,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Find API usage examples grouped by usage pattern")]
+    #[tool(
+        description = "Find literal occurrences of an API name to learn local usage conventions. Returns up to max_examples file/line snippets, optionally labeled call, import, assignment or reference. Classification is text-based, not resolved API identity, so check matches before copying a pattern."
+    )]
     fn api_usage(&self, Parameters(req): Parameters<ApiUsageRequest>) -> CallToolResult {
         json(search::api_usage(
             &req.repo_path,
@@ -403,7 +409,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Rank Python modules using import-graph PageRank")]
+    #[tool(
+        description = "Identify structurally important modules across supported languages using import-graph PageRank. Returns module names, scores, outgoing import counts and incoming importer counts (depth). Filter by module_prefix; enable external_modules to include unresolved imports. Scores measure graph importance, not code quality or runtime cost."
+    )]
     fn coderank_analysis(&self, Parameters(req): Parameters<CodeRankRequest>) -> CallToolResult {
         json(code_rank::coderank_analysis(
             &req.repo_path,
@@ -413,7 +421,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Find modules that are important and frequently referenced")]
+    #[tool(
+        description = "Prioritize modules for review using import-graph importance weighted by a change-frequency estimate. Returns module scores, import counts and change_frequency; min_connections filters weakly connected modules. Frequency uses distinct Git blame commits where available, otherwise textual references, so it is a heuristic rather than a churn metric."
+    )]
     fn code_hotspots(&self, Parameters(req): Parameters<HotspotRequest>) -> CallToolResult {
         json(code_rank::code_hotspots(
             &req.repo_path,
@@ -422,7 +432,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Trace occurrences and transformations of a data identifier")]
+    #[tool(
+        description = "Locate whole-word identifier occurrences across parsed source files. Returns file/line snippets labeled definition, usage, transformation or side_effect, plus inferred layers. The include flags enable extra classifications; they do not filter ordinary usages. This is textual tracing, not alias-aware data-flow or taint analysis."
+    )]
     fn trace_data_flow(&self, Parameters(req): Parameters<DataFlowRequest>) -> CallToolResult {
         json(trace::trace_data_flow(
             &req.repo_path,
@@ -432,7 +444,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Map feature keywords across code layers")]
+    #[tool(
+        description = "Locate a feature by case-insensitive keyword matches in supported source files. Returns file/line snippets, the first matching keyword and a layer inferred from the file path: api, data, tests, ui or business_logic. Use this to find candidate implementation sites, then inspect their symbols with context."
+    )]
     fn trace_feature_impl(&self, Parameters(req): Parameters<FeatureRequest>) -> CallToolResult {
         let keywords = req
             .feature_keywords
@@ -442,12 +456,16 @@ impl RustRankRouter {
         json(trace::trace_feature_impl(&req.repo_path, &keywords))
     }
 
-    #[tool(description = "Find direct dependency impact for a target module")]
+    #[tool(
+        description = "Find modules that directly import target_module, using language-aware local import resolution. Returns import-site file/line snippets and target-to-dependent chains. Supply a module name from query or coderank_analysis. Use impact to explore callers beyond direct imports; this tool does not traverse transitive dependencies."
+    )]
     fn trace_dep_impact(&self, Parameters(req): Parameters<DepImpactRequest>) -> CallToolResult {
         json(trace::trace_dep_impact(&req.repo_path, &req.target_module))
     }
 
-    #[tool(description = "Find error handling patterns and antipatterns")]
+    #[tool(
+        description = "Scan source lines for try/except, raise and throw; optionally flag unwrap and panic patterns. Returns file/line snippets with pattern and heuristic severity. show_evolution adds Git blame commit counts within days_back when available, not historical error diffs. This is a pattern scan, not exhaustive error-handling analysis."
+    )]
     fn error_patterns(&self, Parameters(req): Parameters<ErrorPatternsRequest>) -> CallToolResult {
         json(analysis::error_patterns(
             &req.repo_path,
@@ -457,7 +475,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Detect simple performance bottleneck patterns")]
+    #[tool(
+        description = "Find source lines containing performance-related keywords and return file/line snippets with heuristic severity. focus_areas supplies case-insensitive terms; an empty list uses sleep, range, append and push. include_utility=false skips paths containing util. Findings are review candidates, not measured bottlenecks or profiling results."
+    )]
     fn perf_bottleneck(&self, Parameters(req): Parameters<PerfRequest>) -> CallToolResult {
         let focus = req
             .focus_areas
@@ -471,7 +491,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Trace branch and loop execution paths for a function")]
+    #[tool(
+        description = "Inspect a function by exact name for branch, loop, error-path and optional call-like source lines. Returns file/line snippets labeled by kind. max_depth limits reported findings per matching function, not call-stack depth. This is a static line scan, not executable path enumeration."
+    )]
     fn exec_paths(&self, Parameters(req): Parameters<ExecPathsRequest>) -> CallToolResult {
         json(analysis::exec_paths(
             &req.repo_path,
@@ -481,7 +503,9 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Trace branch and loop execution paths for a function")]
+    #[tool(
+        description = "Compatibility alias for exec_paths with identical arguments and results. Prefer exec_paths for new calls. Scans exact-name function matches for branch, loop, error-path and optional call-like lines; max_depth caps findings per function, not call-stack depth."
+    )]
     fn execute_paths(&self, Parameters(req): Parameters<ExecPathsRequest>) -> CallToolResult {
         json(analysis::execute_paths(
             &req.repo_path,
@@ -491,35 +515,43 @@ impl RustRankRouter {
         ))
     }
 
-    #[tool(description = "Read RustRank JSON configuration")]
+    #[tool(
+        description = "Read the repository's .rustrank_config.json as a JSON object; returns an empty object when the file is absent. Use before changing language, exclusion or embedding settings. This returns stored configuration, not merged defaults or environment overrides, and does not modify files."
+    )]
     fn get_config(&self, Parameters(req): Parameters<ConfigPathRequest>) -> CallToolResult {
         json(config::get_config(&req.repo_path))
     }
 
-    #[tool(description = "Set a RustRank JSON configuration value")]
+    #[tool(
+        description = "Persist a value in .rustrank_config.json and return the updated configuration. key is a dotted path such as languages.enabled; value accepts any JSON type. Creates the file if needed and replaces the selected value. Read get_config first to inspect existing settings; this does not rebuild indexes."
+    )]
     fn set_config(&self, Parameters(req): Parameters<SetConfigRequest>) -> CallToolResult {
         json(config::set_config(&req.repo_path, &req.key, req.value))
     }
 
     #[tool(
-        description = "Return callers, callees, imports, defining file, and resources for one symbol"
+        description = "Inspect a symbol before editing it. Returns its defining file and line span, module, kind, callers, callees, imports and related MCP resource URIs. Call relationships are static heuristics with confidence labels; verify them in source. Use query first if you do not know the symbol name."
     )]
     fn context(&self, Parameters(req): Parameters<ContextRequest>) -> CallToolResult {
         json(agent::symbol_context(&req.repo_path, &req.symbol))
     }
 
-    #[tool(description = "Estimate upstream and downstream blast radius for a symbol or module")]
+    #[tool(
+        description = "Estimate change impact for a symbol or module. Returns affected callers/importers as graph nodes and edges with distance and confidence, plus any stale-index warning. max_depth bounds caller traversal; import relationships are direct. Use before changing shared code; this is a static estimate, not proof of all dependencies."
+    )]
     fn impact(&self, Parameters(req): Parameters<ImpactRequest>) -> CallToolResult {
         json(agent::impact(&req.repo_path, &req.target, req.max_depth))
     }
 
-    #[tool(description = "Map git diff hunks to changed symbols and affected callers/importers")]
+    #[tool(
+        description = "Review unstaged tracked-file changes against the Git index. Returns changed files, symbols overlapping added/modified lines, affected callers/importers and a heuristic risk level. Requires a Git working tree. Staged-only changes and untracked files are excluded; deletions may lack symbol mappings, so also review git diff."
+    )]
     fn detect_changes(&self, Parameters(req): Parameters<ConfigPathRequest>) -> CallToolResult {
         json(agent::detect_changes(&req.repo_path))
     }
 
     #[tool(
-        description = "Agent-oriented graph search combining lexical matches and module centrality"
+        description = "Find relevant modules and symbols from whitespace-separated search terms. Ranks matches using names, paths, source text and importer counts, with optional semantic scores when embeddings are configured. Returns file/line locations, match reasons, scores, resource URIs and process hints. Start here for exploration; use contextual_search for exact or regex matches."
     )]
     fn query(&self, Parameters(req): Parameters<QueryRequest>) -> CallToolResult {
         json(agent::query(&req.repo_path, &req.query, req.limit))
