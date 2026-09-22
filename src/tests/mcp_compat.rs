@@ -287,7 +287,7 @@ async fn set_config_preserves_all_json_value_types() {
 }
 
 #[tokio::test]
-async fn unavailable_embeddings_keep_index_advertised_and_reject_every_argument_shape() {
+async fn unavailable_embeddings_keep_index_advertised_and_build_structural_index() {
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("example.rs"), "fn main() {}\n").unwrap();
     let mut client = Client::start();
@@ -309,21 +309,23 @@ async fn unavailable_embeddings_keep_index_advertised_and_reject_every_argument_
             "{key} still exposed"
         );
     }
-    for arguments in [
-        json!({}),
-        json!({"repo_path":42}),
-        json!({"repo_path":repo.path(),"force_rebuild":true,"clean_stale":true,"embeddings":false}),
-        json!({"embedding_api_key":"ignored-secret","embeddings":true}),
-    ] {
-        client.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index_project","arguments":arguments}})).await;
-        let response = client.receive().await;
-        assert_eq!(response["result"]["isError"], true, "{response}");
+    for embeddings in [json!(false), json!(true), json!(null)] {
+        let response = index_call(&mut client, json!({"repo_path":repo.path(),"force_rebuild":true,"clean_stale":false,"embeddings":embeddings})).await;
+        assert_ne!(response["result"]["isError"], true, "{response}");
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("RUSTRANK_EMBEDDING_BASE_URL"), "{text}");
-        assert!(!text.contains("ignored-secret"));
     }
-    assert!(!repo.path().join(".rustrank").exists());
-    assert!(!repo.path().join("AGENTS.md").exists());
+    assert!(
+        repo.path()
+            .join(".rustrank/index/v1/project_manifest.json")
+            .exists()
+    );
+    assert!(repo.path().join("AGENTS.md").exists());
+    assert!(!repo.path().join(".rustrank/index/v1/embeddings").exists());
+    client.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query","arguments":{"repo_path":repo.path(),"query":"main","limit":10}}})).await;
+    let response = client.receive().await;
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    assert!(response.to_string().contains("main"));
     client
         .send(json!({"jsonrpc":"2.0","id":4,"method":"ping"}))
         .await;
@@ -334,6 +336,23 @@ async fn unavailable_embeddings_keep_index_advertised_and_reject_every_argument_
 async fn index_call(client: &mut Client, arguments: Value) -> Value {
     client.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_project","arguments":arguments}})).await;
     client.receive().await
+}
+
+async fn fallback_index(client: &mut Client) -> Value {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("sample.rs"), "fn main() {}\n").unwrap();
+    let result = index_call(
+        client,
+        json!({"repo_path":repo.path(),"force_rebuild":false,"clean_stale":false}),
+    )
+    .await;
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    assert!(
+        repo.path()
+            .join(".rustrank/index/v1/project_manifest.json")
+            .exists()
+    );
+    result
 }
 
 #[tokio::test]
@@ -353,8 +372,7 @@ async fn invalid_embedding_settings_are_reported_without_stopping_server() {
     ] {
         let mut client = Client::with_env(&settings);
         client.initialize().await;
-        let result = index_call(&mut client, json!({})).await;
-        assert_eq!(result["result"]["isError"], true);
+        let result = fallback_index(&mut client).await;
         assert!(result.to_string().contains(expected));
         client.stop().await;
     }
@@ -377,8 +395,7 @@ async fn invalid_embedding_settings_are_reported_without_stopping_server() {
             ("RUSTRANK_EMBEDDING_DIMS", dims),
         ]);
         client.initialize().await;
-        let result = index_call(&mut client, json!({})).await;
-        assert_eq!(result["result"]["isError"], true, "{result}");
+        let result = fallback_index(&mut client).await;
         assert!(result.to_string().contains(expected), "{result}");
         assert!(!result.to_string().contains("do-not-leak"));
         client.stop().await;
@@ -417,8 +434,7 @@ async fn embedding_probe_rejects_http_errors_invalid_responses_and_wrong_dimensi
             ("RUSTRANK_EMBEDDING_API_KEY", "do-not-leak"),
         ]);
         client.initialize().await;
-        let result = index_call(&mut client, json!({"embeddings":false})).await;
-        assert_eq!(result["result"]["isError"], true, "{result}");
+        let result = fallback_index(&mut client).await;
         assert!(result.to_string().contains(expected), "{result}");
         assert!(!result.to_string().contains("do-not-leak"));
         client.stop().await;
@@ -478,6 +494,26 @@ async fn valid_embedding_endpoint_is_probed_once_and_index_uses_environment() {
             count,
             "false must skip vector generation"
         );
+        client.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query","arguments":{"repo_path":repo.path(),"query":"unrelated-term","limit":10}}})).await;
+        let result = client.receive().await;
+        assert_ne!(result["result"]["isError"], true, "{result}");
+        let rows: Value =
+            serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["match_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("semantic"))),
+            "ENV-configured query did not use embeddings: {rows}"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            count + 1,
+            "query must call the shared endpoint"
+        );
         for (headers, body) in requests.lock().unwrap().iter() {
             assert_eq!(body["model"], "fixture-model");
             assert_eq!(body["dimensions"], 3);
@@ -507,8 +543,7 @@ async fn embedding_probe_timeout_still_allows_initialization() {
         ("RUSTRANK_EMBEDDING_DIMS", "3"),
     ]);
     client.initialize().await;
-    let result = index_call(&mut client, json!({})).await;
-    assert_eq!(result["result"]["isError"], true, "{result}");
+    let result = fallback_index(&mut client).await;
     assert!(result.to_string().contains("timed out"), "{result}");
     client.stop().await;
     task.abort();

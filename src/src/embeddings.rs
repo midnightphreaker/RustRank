@@ -110,6 +110,9 @@ pub struct EmbeddingSource {
     pub path: String,
     pub content_hash: String,
     pub content: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,6 +123,22 @@ pub struct CachedEmbedding {
     pub model: String,
     pub dimensions: usize,
     pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub start_line: usize,
+    #[serde(default)]
+    pub end_line: usize,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub provider_hash: String,
+}
+
+#[derive(Debug)]
+pub struct SemanticMatch {
+    pub path: String,
+    pub line: usize,
+    pub symbol: Option<String>,
+    pub score: f64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -188,7 +207,21 @@ pub fn index_embeddings(
     let cache_dir = cache_dir(root);
     std::fs::create_dir_all(&cache_dir)?;
     for source in sources {
-        let cache_path = cache_file(&cache_dir, &source.content_hash);
+        let cache_key = blake3::hash(&serde_json::to_vec(&(
+            "rustrank_embedding_chunk_v2",
+            &source.path,
+            &source.content_hash,
+            source.start_line,
+            source.end_line,
+            &source.symbol,
+            &source.content,
+            &config.model,
+            config.dimensions,
+            provider_hash(config),
+        ))?)
+        .to_hex()
+        .to_string();
+        let cache_path = cache_file(&cache_dir, &cache_key);
         if let Some(cached) = read_cached_embedding(
             &cache_path,
             config,
@@ -201,13 +234,20 @@ pub fn index_embeddings(
         }
 
         match fetch_embedding(config, &source.content) {
-            Ok(embedding) if embedding.len() == config.dimensions => {
+            Ok(embedding)
+                if embedding.len() == config.dimensions
+                    && embedding.iter().all(|v| v.is_finite()) =>
+            {
                 let cached = CachedEmbedding {
-                    schema: "rustrank_embedding".to_string(),
+                    schema: "rustrank_embedding_chunk_v2".to_string(),
                     path: source.path.clone(),
                     content_hash: source.content_hash.clone(),
                     model: config.model.clone(),
                     dimensions: config.dimensions,
+                    start_line: source.start_line,
+                    end_line: source.end_line,
+                    symbol: source.symbol.clone(),
+                    provider_hash: provider_hash(config),
                     embedding,
                 };
                 write_json_atomic(&cache_path, &cached)?;
@@ -266,7 +306,15 @@ pub fn cached_embeddings(
                 continue;
             }
         };
-        if cached.dimensions != expected_dimensions || cached.embedding.len() != expected_dimensions
+        if cached.schema != "rustrank_embedding_chunk_v2"
+            || cached.start_line == 0
+            || cached.end_line < cached.start_line
+        {
+            continue;
+        }
+        if cached.dimensions != expected_dimensions
+            || cached.embedding.len() != expected_dimensions
+            || cached.embedding.iter().any(|v| !v.is_finite())
         {
             warnings.push(format!(
                 "embedding dimension mismatch for {}: expected {}, got {}",
@@ -285,40 +333,84 @@ pub fn semantic_scores(
     root: &Path,
     query: &str,
     config: &EmbeddingConfig,
-) -> Result<(HashMap<String, f64>, Vec<String>)> {
+) -> Result<(Vec<SemanticMatch>, Vec<String>)> {
     if !config.enabled {
-        return Ok((HashMap::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new()));
     }
     let (cached, mut warnings) = cached_embeddings(root, config.dimensions)?;
+    let mut file_hashes = HashMap::new();
+    let provider = provider_hash(config);
+    let cached = cached
+        .into_iter()
+        .filter(|row| {
+            if row.model != config.model || row.provider_hash != provider {
+                return false;
+            }
+            // Old and deleted source must not keep contributing semantic matches.
+            let current_hash = file_hashes.entry(row.path.clone()).or_insert_with(|| {
+                let relative = Path::new(&row.path);
+                if relative.is_absolute()
+                    || relative
+                        .components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return None;
+                }
+                std::fs::read(root.join(relative))
+                    .ok()
+                    .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+            });
+            current_hash.as_deref() == Some(row.content_hash.as_str())
+        })
+        .collect::<Vec<_>>();
     if cached.is_empty() {
-        return Ok((HashMap::new(), warnings));
+        return Ok((Vec::new(), warnings));
     }
     let query_embedding = match fetch_embedding(config, query) {
-        Ok(embedding) if embedding.len() == config.dimensions => embedding,
+        Ok(embedding)
+            if embedding.len() == config.dimensions && embedding.iter().all(|v| v.is_finite()) =>
+        {
+            embedding
+        }
         Ok(embedding) => {
             warnings.push(format!(
-                "query embedding dimension mismatch: expected {}, got {}",
+                "invalid query embedding: expected {} finite values, got {} values",
                 config.dimensions,
                 embedding.len()
             ));
-            return Ok((HashMap::new(), warnings));
+            return Ok((Vec::new(), warnings));
         }
         Err(err) => {
             warnings.push(format!("query embedding request failed: {err}"));
-            return Ok((HashMap::new(), warnings));
+            return Ok((Vec::new(), warnings));
         }
     };
-
-    let scores = cached
+    // Several byte-bounded chunks can occupy one long source line. Keep its
+    // strongest match instead of rewarding the location for having more chunks.
+    let mut locations = HashMap::new();
+    for row in cached {
+        let score = cosine_similarity(&query_embedding, &row.embedding).max(0.0);
+        locations
+            .entry((row.path, row.start_line, row.symbol))
+            .and_modify(|best: &mut f64| *best = best.max(score))
+            .or_insert(score);
+    }
+    let scores = locations
         .into_iter()
-        .map(|cached| {
-            (
-                cached.path,
-                cosine_similarity(&query_embedding, &cached.embedding).max(0.0),
-            )
+        .map(|((path, line, symbol), score)| SemanticMatch {
+            path,
+            line,
+            symbol,
+            score,
         })
         .collect();
     Ok((scores, warnings))
+}
+
+fn provider_hash(config: &EmbeddingConfig) -> String {
+    blake3::hash(config.base_url.trim_end_matches('/').as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 pub fn fetch_embedding(config: &EmbeddingConfig, input: &str) -> Result<Vec<f32>> {
@@ -423,7 +515,10 @@ fn read_cached_embedding(
             return Ok(None);
         }
     };
-    if cached.content_hash == content_hash
+    if cached.schema == "rustrank_embedding_chunk_v2"
+        && cached.provider_hash == provider_hash(config)
+        && cached.embedding.iter().all(|value| value.is_finite())
+        && cached.content_hash == content_hash
         && cached.model == config.model
         && cached.dimensions == config.dimensions
         && cached.embedding.len() == config.dimensions

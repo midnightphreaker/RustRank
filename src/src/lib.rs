@@ -1,4 +1,5 @@
 pub mod context;
+mod embedding_chunks;
 pub mod embeddings;
 pub mod error;
 pub mod fmt;

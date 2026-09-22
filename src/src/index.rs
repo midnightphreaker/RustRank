@@ -257,11 +257,16 @@ pub fn index_project_with_embeddings(
             };
 
             referenced_cache_files.insert(cache_file);
-            embedding_sources.push(EmbeddingSource {
-                path: rel_path,
-                content_hash: file_hash.value.clone(),
-                content,
-            });
+            for chunk in crate::embedding_chunks::source_chunks(&content, &fact.symbols) {
+                embedding_sources.push(EmbeddingSource {
+                    path: rel_path.clone(),
+                    content_hash: file_hash.value.clone(),
+                    content: chunk.content,
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    symbol: chunk.symbol,
+                });
+            }
             write_json_atomic(&files_dir.join(cache_file_name), &fact)?;
             modules.push(module_from_fact(&fact));
             indexed_files.push((path.clone(), language));

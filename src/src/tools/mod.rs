@@ -67,7 +67,7 @@ pub struct RustRankRouter {
 impl RustRankRouter {
     pub fn new() -> Self {
         let embedding_config = crate::embeddings::validated_server_config().map_err(|problem| {
-            format!("index_project unavailable: {problem}. Configure RUSTRANK_EMBEDDING_BASE_URL, RUSTRANK_EMBEDDING_MODEL and RUSTRANK_EMBEDDING_DIMS (RUSTRANK_EMBEDDING_API_KEY is optional), then restart RustRank.")
+            format!("Embeddings unavailable: {problem}. Configure RUSTRANK_EMBEDDING_BASE_URL, RUSTRANK_EMBEDDING_MODEL and RUSTRANK_EMBEDDING_DIMS (RUSTRANK_EMBEDDING_API_KEY is optional), then restart RustRank.")
         });
         if let Err(problem) = &embedding_config {
             eprintln!("RustRank DEBUG: {problem}");
@@ -303,27 +303,37 @@ struct QueryRequest {
 #[tool_router]
 impl RustRankRouter {
     #[tool(
-        description = "Build or refresh repository indexes and generated AGENTS.md guidance. Requires an embedding endpoint validated at server startup via RUSTRANK_EMBEDDING_* environment variables; otherwise returns the startup problem without writing files. Embeddings default on; false skips vector generation after successful validation. Returns counts, cache statistics and warnings; clean_stale removes obsolete entries."
+        description = "Build or refresh repository indexes and generated AGENTS.md guidance. Embeds bounded function/source chunks using the server’s RUSTRANK_EMBEDDING_* configuration. If embeddings are unavailable, still builds the structural index and returns a warning. embeddings defaults on; false skips vectors. Returns counts, cache statistics and warnings; clean_stale removes obsolete structural cache entries."
     )]
     fn index_project(&self, Parameters(req): Parameters<IndexProjectRequest>) -> CallToolResult {
-        let config = match &self.embedding_config {
-            Ok(config) => config,
-            Err(problem) => return json::<()>(Err(crate::AppError::Context(problem.clone()))),
-        };
-        let repo_path = req.repo_path.clone();
-        let result = crate::index::index_project_with_embeddings(
-            &req.repo_path,
-            req.languages,
-            req.force_rebuild,
-            req.clean_stale,
-            EmbeddingOptions {
+        let options = match &self.embedding_config {
+            Ok(config) => EmbeddingOptions {
                 enabled: Some(req.embeddings.unwrap_or(true)),
                 base_url: Some(config.base_url.clone()),
                 model: Some(config.model.clone()),
                 dimensions: Some(config.dimensions),
                 api_key: config.api_key.clone(),
             },
+            Err(_) => EmbeddingOptions {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        };
+        let repo_path = req.repo_path.clone();
+        let mut result = crate::index::index_project_with_embeddings(
+            &req.repo_path,
+            req.languages,
+            req.force_rebuild,
+            req.clean_stale,
+            options,
         );
+        if let Ok(response) = &mut result
+            && let Err(problem) = &self.embedding_config
+        {
+            response.warnings.push(format!(
+                "Embeddings skipped; structural index built. {problem}"
+            ));
+        }
         if result.is_ok()
             && let Err(err) = agent::set_current_repo(repo_path)
         {
@@ -517,30 +527,20 @@ impl RustRankRouter {
     }
 
     #[tool(
-        description = "Find relevant modules and symbols from whitespace-separated search terms. Ranks matches using names, paths, source text and importer counts, with optional semantic scores when embeddings are configured. Returns file/line locations, match reasons, scores, resource URIs and process hints. Start here for exploration; use contextual_search for exact or regex matches."
+        description = "Find relevant modules and symbols from whitespace-separated search terms. Ranks matches using names, paths, source text and importer counts, with chunk-level semantic matches using the server’s embedding configuration. Falls back to text and graph matching when embeddings are unavailable. Returns file/line locations, match reasons, scores, resource URIs and process hints. Start here for exploration; use contextual_search for exact or regex matches."
     )]
     fn query(&self, Parameters(req): Parameters<QueryRequest>) -> CallToolResult {
-        json(agent::query(&req.repo_path, &req.query, req.limit))
+        json(agent::query_with_embeddings(
+            &req.repo_path,
+            &req.query,
+            req.limit,
+            self.embedding_config.as_ref().ok(),
+        ))
     }
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for RustRankRouter {
-    async fn call_tool(
-        &self,
-        request: rmcp::model::CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        // Check availability before deserializing arguments, including incomplete/stale calls.
-        if request.name == "index_project"
-            && let Err(problem) = &self.embedding_config
-        {
-            return Ok(json::<()>(Err(crate::AppError::Context(problem.clone()))));
-        }
-        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(call).await
-    }
-
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()

@@ -1903,7 +1903,11 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
             let headers = &request[..header_end];
             let content_length = headers
                 .lines()
-                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim())
+                })
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(0);
             if buffer.len() >= header_end + 4 + content_length {
@@ -1961,4 +1965,78 @@ fn commit_fixture(root: &std::path::Path) {
         &[],
     )
     .expect("commit");
+}
+
+#[test]
+fn semantic_chunks_rank_only_the_matching_function_and_ignore_stale_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("service.py");
+    std::fs::write(
+        &source,
+        "def auth_token():\n    return 'session'\n\ndef billing_invoice():\n    return 'ledger'\n",
+    )
+    .unwrap();
+    let repo = dir.path().to_str().unwrap();
+    let server = MockEmbeddingServer::start(MockEmbeddingBehavior::ByInput);
+    set_config(repo, "embeddings", serde_json::json!({"enabled":true,"base_url":server.base_url,"model":"text-embedding-test","dimensions":3})).unwrap();
+    index_project_with_embeddings(repo, None, false, false, EmbeddingOptions::default()).unwrap();
+    let rows = query(repo, "payments", 10).unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.symbol.as_deref() == Some("billing_invoice") && r.line == 4),
+        "{rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.symbol.as_deref() == Some("auth_token")
+                && r.match_reasons.iter().any(|reason| reason == "semantic")),
+        "unrelated function inherited semantic score: {rows:?}"
+    );
+    assert!(
+        server.request_count() >= 3,
+        "two functions plus query require separate vectors"
+    );
+    set_config(
+        repo,
+        "embeddings.model",
+        serde_json::json!("different-model"),
+    )
+    .unwrap();
+    assert!(
+        query(repo, "payments", 10).unwrap().is_empty(),
+        "model-incompatible vectors must be ignored"
+    );
+    set_config(
+        repo,
+        "embeddings.model",
+        serde_json::json!("text-embedding-test"),
+    )
+    .unwrap();
+    std::fs::write(&source, "def auth_token():\n    return 'changed'\n").unwrap();
+    assert!(
+        query(repo, "payments", 10).unwrap().is_empty(),
+        "stale vectors must be ignored"
+    );
+}
+
+#[test]
+fn semantic_chunks_on_one_long_line_do_not_multiply_the_match_score() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("service.py"),
+        format!("# {}", "billing_invoice ".repeat(1000)),
+    )
+    .unwrap();
+    let repo = dir.path().to_str().unwrap();
+    let server = MockEmbeddingServer::start(MockEmbeddingBehavior::ByInput);
+    set_config(repo, "embeddings", serde_json::json!({"enabled":true,"base_url":server.base_url,"model":"text-embedding-test","dimensions":3})).unwrap();
+    index_project_with_embeddings(repo, None, false, false, EmbeddingOptions::default()).unwrap();
+    let rows = query(repo, "payments", 10).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].score <= 1.5,
+        "duplicate source location inflated score: {rows:?}"
+    );
+    assert_eq!(rows[0].match_reasons, ["semantic"]);
 }

@@ -318,12 +318,22 @@ pub fn detect_changes(repo_path: &str) -> Result<ChangeReport> {
 }
 
 pub fn query(repo_path: &str, query: &str, limit: usize) -> Result<Vec<QueryResult>> {
+    let config = embeddings::config_for_repo(Path::new(repo_path), EmbeddingOptions::default())?;
+    query_with_embeddings(repo_path, query, limit, Some(&config))
+}
+
+pub fn query_with_embeddings(
+    repo_path: &str,
+    query: &str,
+    limit: usize,
+    embedding_config: Option<&embeddings::EmbeddingConfig>,
+) -> Result<Vec<QueryResult>> {
     let graph = RepoGraph::parse(repo_path)?;
     let processes = derive_processes(&graph.modules, &graph.resolver);
-    let embedding_config =
-        embeddings::config_for_repo(Path::new(repo_path), EmbeddingOptions::default())?;
-    let (semantic_scores, _semantic_warnings) =
-        embeddings::semantic_scores(Path::new(repo_path), query, &embedding_config)?;
+    let semantic_matches = match embedding_config {
+        Some(config) => embeddings::semantic_scores(Path::new(repo_path), query, config)?.0,
+        None => Vec::new(),
+    };
     let terms = query
         .split_whitespace()
         .map(str::to_ascii_lowercase)
@@ -334,7 +344,6 @@ pub fn query(repo_path: &str, query: &str, limit: usize) -> Result<Vec<QueryResu
         let module_text = module_name.to_ascii_lowercase();
         let file_text = path_string(&module.path).to_ascii_lowercase();
         let centrality = graph.importer_count(&module_name) as f64 * 0.25;
-        let semantic = semantic_scores.get(&path_string(&module.path)).copied();
         let mut module_score = 0.0;
         let mut module_reasons = Vec::new();
         for term in &terms {
@@ -342,10 +351,6 @@ pub fn query(repo_path: &str, query: &str, limit: usize) -> Result<Vec<QueryResu
                 module_score += 1.0;
                 module_reasons.push(format!("module:{term}"));
             }
-        }
-        if let Some(score) = semantic.filter(|score| *score > 0.0) {
-            module_score += score * 1.5;
-            module_reasons.push("semantic".to_string());
         }
         if module_score > 0.0 {
             results.push(QueryResult {
@@ -378,10 +383,6 @@ pub fn query(repo_path: &str, query: &str, limit: usize) -> Result<Vec<QueryResu
                     reasons.push(format!("line:{term}"));
                 }
             }
-            if let Some(semantic_score) = semantic.filter(|score| *score > 0.0) {
-                score += semantic_score * 0.5;
-                reasons.push("semantic".to_string());
-            }
             if score > 0.0 {
                 results.push(QueryResult {
                     file: path_string(&module.path),
@@ -396,11 +397,44 @@ pub fn query(repo_path: &str, query: &str, limit: usize) -> Result<Vec<QueryResu
             }
         }
     }
+    // Score the matching chunk, never every symbol in the same file.
+    for hit in semantic_matches.into_iter().filter(|hit| hit.score > 0.0) {
+        let Some(module) = graph
+            .modules
+            .iter()
+            .find(|module| path_string(&module.path) == hit.path)
+        else {
+            continue;
+        };
+        let module_name = graph.resolver.module_name_for(module);
+        if let Some(row) = results
+            .iter_mut()
+            .find(|row| row.file == hit.path && row.line == hit.line && row.symbol == hit.symbol)
+        {
+            row.score += hit.score * 1.5;
+            row.match_reasons.push("semantic".into());
+        } else {
+            results.push(QueryResult {
+                file: hit.path,
+                module: module_name.clone(),
+                process: hit
+                    .symbol
+                    .as_deref()
+                    .and_then(|name| process_for_symbol(&processes, name)),
+                symbol: hit.symbol,
+                line: hit.line,
+                score: hit.score * 1.5 + graph.importer_count(&module_name) as f64 * 0.25,
+                match_reasons: vec!["semantic".into()],
+                resource: format!("{MODULE_URI_PREFIX}{module_name}"),
+            });
+        }
+    }
     results.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.symbol.cmp(&b.symbol))
     });
     results.truncate(limit.max(1));
     Ok(results)
