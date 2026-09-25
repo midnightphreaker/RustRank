@@ -1614,6 +1614,7 @@ fn query_uses_cached_embeddings_for_semantic_ranking() {
             model: None,
             dimensions: None,
             api_key: None,
+            max_input_tokens: None,
         },
     )
     .expect("index embeddings");
@@ -1884,6 +1885,7 @@ fn embedding_options(base_url: &str, api_key: Option<&str>) -> EmbeddingOptions 
         model: Some("text-embedding-test".to_string()),
         dimensions: Some(3),
         api_key: api_key.map(ToOwned::to_owned),
+        max_input_tokens: None,
     }
 }
 
