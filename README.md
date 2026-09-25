@@ -173,6 +173,7 @@ Set these variables in the **RustRank server process** before starting it:
 | `RUSTRANK_EMBEDDING_MODEL` | Required for embeddings | Model identifier accepted by that endpoint. |
 | `RUSTRANK_EMBEDDING_DIMS` | Required for embeddings | Positive integer matching the returned vector dimensions. |
 | `RUSTRANK_EMBEDDING_API_KEY` | Optional | Bearer token. Unset or blank sends no Authorization header. |
+| `RUSTRANK_EMBEDDING_MAX_INPUT_TOKENS` | Optional | Requested input ceiling. RustRank reads the selected model's `max_input_tokens` from `/model/info` or `/models` when available and uses the smaller value if both are present. |
 
 For a shell-launched server:
 
@@ -186,17 +187,19 @@ export RUSTRANK_EMBEDDING_DIMS=1536
 
 For a client-launched server, add the variables to that client's server `env` configuration. Values above are examples: use your endpoint's actual model and dimensions. The base URL must not contain credentials, a query string, or a fragment.
 
-At startup, RustRank sends a small test embedding request with a **five-second timeout**. It checks HTTP success, response structure, vector dimensions, and finite numeric values. Redirects are not followed. HTTP connections share this startup result.
+At startup, RustRank tries to read the selected model's `max_input_tokens` from the endpoint, then sends a small test embedding request with a **five-second timeout**. It checks HTTP success, response structure, vector dimensions, and finite numeric values. Redirects are not followed. If metadata is unavailable and the variable is unset, the input limit defaults to 512. An invalid variable prevents embedding startup; when the variable differs from endpoint metadata, tool results warn and RustRank uses the smaller limit.
 
 | Endpoint state | `index_project` | `query` |
 | --- | --- | --- |
 | Validated | Builds the structural index and chunk vectors; `embeddings: false` skips vectors. | Combines text/graph matches with compatible cached chunk vectors. |
-| Missing settings or failed startup check | Builds the structural index, warns, and skips embeddings. | Uses text and graph matching. |
-| Request fails after startup | Reports embedding failures in indexing warnings. | Falls back to text and graph matching if the query embedding fails. |
+| Missing settings or failed startup check | Builds the structural index, reports an MCP error with a warning, and skips embeddings. | Uses text and graph matching. |
+| Request fails after startup | Reports the failed chunks, percentage coverage and an MCP error result while preserving structural results. | Falls back to text and graph matching if the query embedding fails. |
 
 Correct the endpoint/settings and **restart RustRank** to retry startup validation. Other tools remain available throughout.
 
-Source is split at function boundaries; oversized functions and module-level text are split further into chunks of at most **4,096 UTF-8 bytes and 80 lines**. These are byte/line limits, not model-specific token guarantees. Semantic results retain the matching file, symbol where available, and starting line.
+Source is split at function boundaries; oversized functions and module-level text are split further into chunks of at most **4,096 UTF-8 bytes and 80 lines**. Before sending a chunk or query, RustRank divides inputs into UTF-8 pieces no larger than the effective token limit minus eight bytes. This conservative bound leaves room for model special tokens without requiring a model-specific tokenizer. It averages the returned vectors, weighted by piece length, into one vector for the source chunk or query. Semantic results retain the matching file, symbol where available, and starting line.
+
+`index_project` returns `embedding_coverage` and writes the current run's percentage to `.rustrank/index/v1/embedding_coverage.json` as indexing progresses. Each later tool result includes a warning and a rerun instruction while coverage is below 100%. Run `index_project` again with the same `repo_path`, `force_rebuild: false`, and `clean_stale: true` after correcting endpoint errors. Valid vectors are reused; missing vectors are retried. Each run rescans the current source set, adds new or changed chunks, and excludes deleted or changed source vectors from semantic search. CLI indexing exits nonzero when embedding chunks fail.
 
 Cached vectors are matched to their source content, endpoint, model, and dimensions. Changed/deleted files and incompatible or legacy whole-file vectors are ignored. **Re-index after upgrading from whole-file embeddings.** Old vector files can remain on disk without affecting results.
 
@@ -239,9 +242,10 @@ The CLI indexes repositories without an MCP client:
 | `--embedding-base-url URL` | Override the embedding API base. |
 | `--embedding-model MODEL` | Override the model. |
 | `--embedding-dims N` | Override vector dimensions. |
+| `--embedding-max-input-tokens N` | Override the input limit for CLI indexing; defaults to 512. |
 | `--embedding-api-key KEY` | Supply optional bearer authentication. |
 
-CLI embedding precedence is **explicit flags → repository `embeddings` settings → defaults**. Repository keys are `enabled`, `base_url`, `model`, and `dimensions`; repository-stored API keys are not read. The CLI does not consume the MCP embedding environment variables.
+CLI embedding precedence is **explicit flags → repository `embeddings` settings → defaults**. Repository keys are `enabled`, `base_url`, `model`, `dimensions`, and `max_input_tokens`; repository-stored API keys are not read. The CLI does not consume the MCP embedding environment variables.
 
 Defaults are embeddings disabled, base `https://api.phrk.org/v1`, model `text-image-embedding`, and 1,536 dimensions. Set your own endpoint details explicitly when enabling CLI embeddings:
 
@@ -352,6 +356,7 @@ Indexing creates or updates these files under the selected repository:
 ```text
 .rustrank/index/v1/
   project_manifest.json
+  embedding_coverage.json                   # current progress and failures
   languages/<language>/index.json
   languages/<language>/files/<content-hash>.json
   embeddings/<chunk-id>.json                  # when vectors are generated

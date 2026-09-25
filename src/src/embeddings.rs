@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -15,6 +16,8 @@ use crate::{
 pub const DEFAULT_BASE_URL: &str = "https://api.phrk.org/v1";
 pub const DEFAULT_MODEL: &str = "text-image-embedding";
 pub const DEFAULT_DIMENSIONS: usize = 1536;
+pub const DEFAULT_MAX_INPUT_TOKENS: usize = 512;
+const TOKEN_OVERHEAD: usize = 8;
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct EmbeddingOptions {
@@ -23,6 +26,7 @@ pub struct EmbeddingOptions {
     pub model: Option<String>,
     pub dimensions: Option<usize>,
     pub api_key: Option<String>,
+    pub max_input_tokens: Option<usize>,
 }
 
 impl std::fmt::Debug for EmbeddingOptions {
@@ -33,6 +37,7 @@ impl std::fmt::Debug for EmbeddingOptions {
             .field("model", &self.model)
             .field("dimensions", &self.dimensions)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("max_input_tokens", &self.max_input_tokens)
             .finish()
     }
 }
@@ -44,6 +49,8 @@ pub struct EmbeddingConfig {
     pub model: String,
     pub dimensions: usize,
     pub api_key: Option<String>,
+    pub max_input_tokens: usize,
+    pub metadata_warning: Option<String>,
 }
 
 /// Resolve server-owned settings without repository defaults, then test a real embedding.
@@ -72,12 +79,35 @@ pub fn validated_server_config() -> std::result::Result<EmbeddingConfig, String>
     {
         return Err("RUSTRANK_EMBEDDING_BASE_URL must be an HTTP(S) API base URL without credentials, query or fragment".into());
     }
+    let configured_limit = std::env::var("RUSTRANK_EMBEDDING_MAX_INPUT_TOKENS").ok();
+    let explicit_limit = configured_limit
+        .map(|value| configured_max_input_tokens(Some(value)))
+        .transpose()?;
+    let detected_limit = detect_max_input_tokens(
+        &base_url,
+        &model,
+        non_empty(std::env::var("RUSTRANK_EMBEDDING_API_KEY").ok()).as_deref(),
+    );
+    let max_input_tokens = match (explicit_limit, detected_limit) {
+        (Some(configured), Some(detected)) => configured.min(detected),
+        (Some(configured), None) => configured,
+        (None, Some(detected)) => detected,
+        (None, None) => DEFAULT_MAX_INPUT_TOKENS,
+    };
+    let metadata_warning = match (explicit_limit, detected_limit) {
+        (Some(configured), Some(detected)) if configured != detected => Some(format!(
+            "WARNING: RUSTRANK_EMBEDDING_MAX_INPUT_TOKENS={configured} differs from endpoint max_input_tokens={detected}; RustRank uses {max_input_tokens}."
+        )),
+        _ => None,
+    };
     let config = EmbeddingConfig {
         enabled: true,
         base_url,
         model,
         dimensions,
         api_key: non_empty(std::env::var("RUSTRANK_EMBEDDING_API_KEY").ok()),
+        max_input_tokens,
+        metadata_warning,
     };
     let vector = fetch_embedding(&config, "RustRank startup embedding check")
         .map_err(|err| err.to_string())?;
@@ -101,6 +131,8 @@ impl std::fmt::Debug for EmbeddingConfig {
             .field("model", &self.model)
             .field("dimensions", &self.dimensions)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("max_input_tokens", &self.max_input_tokens)
+            .field("metadata_warning", &self.metadata_warning)
             .finish()
     }
 }
@@ -143,9 +175,42 @@ pub struct SemanticMatch {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbeddingIndexStats {
+    pub total: usize,
     pub indexed: usize,
     pub cache_hits: usize,
+    pub failed: usize,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbeddingCoverage {
+    pub enabled: bool,
+    pub total_chunks: usize,
+    pub cached_chunks: usize,
+    pub indexed_chunks: usize,
+    pub failed_chunks: usize,
+    pub percent: usize,
+}
+
+impl EmbeddingIndexStats {
+    pub fn coverage(&self, enabled: bool) -> EmbeddingCoverage {
+        let ready = self.cache_hits + self.indexed;
+        EmbeddingCoverage {
+            enabled,
+            total_chunks: self.total,
+            cached_chunks: self.cache_hits,
+            indexed_chunks: self.indexed,
+            failed_chunks: self.failed,
+            percent: if enabled {
+                ready
+                    .saturating_mul(100)
+                    .checked_div(self.total)
+                    .unwrap_or(100)
+            } else {
+                0
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +242,19 @@ pub fn config_for_repo(repo_path: &Path, overrides: EmbeddingOptions) -> Result<
         .and_then(|value| value.get("dimensions"))
         .and_then(Value::as_u64)
         .map(|value| value as usize);
+    let config_max_input_tokens = embeddings
+        .and_then(|value| value.get("max_input_tokens"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let max_input_tokens = overrides
+        .max_input_tokens
+        .or(config_max_input_tokens)
+        .unwrap_or(DEFAULT_MAX_INPUT_TOKENS);
+    if max_input_tokens < 16 {
+        return Err(AppError::Validation(
+            "embedding max_input_tokens must be at least 16".to_string(),
+        ));
+    }
 
     Ok(EmbeddingConfig {
         enabled: overrides.enabled.unwrap_or(config_enabled),
@@ -191,6 +269,8 @@ pub fn config_for_repo(repo_path: &Path, overrides: EmbeddingOptions) -> Result<
             .or(config_dimensions)
             .unwrap_or(DEFAULT_DIMENSIONS),
         api_key: non_empty(overrides.api_key),
+        max_input_tokens,
+        metadata_warning: None,
     })
 }
 
@@ -199,13 +279,18 @@ pub fn index_embeddings(
     config: &EmbeddingConfig,
     sources: &[EmbeddingSource],
 ) -> Result<EmbeddingIndexStats> {
-    let mut stats = EmbeddingIndexStats::default();
+    let mut stats = EmbeddingIndexStats {
+        total: sources.len(),
+        ..Default::default()
+    };
+    persist_coverage(root, &stats, config.enabled)?;
     if !config.enabled {
         return Ok(stats);
     }
 
     let cache_dir = cache_dir(root);
     std::fs::create_dir_all(&cache_dir)?;
+    let mut last_reported_decile = 0;
     for source in sources {
         let cache_key = blake3::hash(&serde_json::to_vec(&(
             "rustrank_embedding_chunk_v2",
@@ -230,6 +315,8 @@ pub fn index_embeddings(
         )? && cached.path == source.path
         {
             stats.cache_hits += 1;
+            persist_coverage(root, &stats, true)?;
+            report_progress(&stats, &mut last_reported_decile);
             continue;
         }
 
@@ -253,19 +340,50 @@ pub fn index_embeddings(
                 write_json_atomic(&cache_path, &cached)?;
                 stats.indexed += 1;
             }
-            Ok(embedding) => stats.warnings.push(format!(
-                "embedding dimension mismatch for {}: expected {}, got {}",
-                source.path,
-                config.dimensions,
-                embedding.len()
-            )),
-            Err(err) => stats.warnings.push(format!(
-                "embedding request failed for {}: {}",
-                source.path, err
-            )),
+            Ok(embedding) => {
+                stats.failed += 1;
+                stats.warnings.push(format!(
+                    "embedding dimension mismatch for {}: expected {} finite values, got {}",
+                    source.path,
+                    config.dimensions,
+                    embedding.len()
+                ));
+            }
+            Err(err) => {
+                stats.failed += 1;
+                stats.warnings.push(format!(
+                    "embedding request failed for {}:{}-{}: {}",
+                    source.path, source.start_line, source.end_line, err
+                ));
+            }
         }
+        persist_coverage(root, &stats, true)?;
+        report_progress(&stats, &mut last_reported_decile);
     }
     Ok(stats)
+}
+
+fn persist_coverage(root: &Path, stats: &EmbeddingIndexStats, enabled: bool) -> Result<()> {
+    write_json_atomic(
+        &root.join(".rustrank/index/v1/embedding_coverage.json"),
+        &stats.coverage(enabled),
+    )
+}
+
+fn report_progress(stats: &EmbeddingIndexStats, last_reported_decile: &mut usize) {
+    if stats.total == 0 {
+        return;
+    }
+    let ready = stats.cache_hits + stats.indexed;
+    let decile = ready * 10 / stats.total;
+    if decile > *last_reported_decile {
+        *last_reported_decile = decile;
+        eprintln!(
+            "RustRank: embedding cache coverage {}% ({ready}/{} current chunks)",
+            ready * 100 / stats.total,
+            stats.total
+        );
+    }
 }
 
 pub fn cached_embeddings(
@@ -408,9 +526,16 @@ pub fn semantic_scores(
 }
 
 fn provider_hash(config: &EmbeddingConfig) -> String {
-    blake3::hash(config.base_url.trim_end_matches('/').as_bytes())
-        .to_hex()
-        .to_string()
+    blake3::hash(
+        format!(
+            "{}:{}",
+            config.base_url.trim_end_matches('/'),
+            config.max_input_tokens
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
 }
 
 pub fn fetch_embedding(config: &EmbeddingConfig, input: &str) -> Result<Vec<f32>> {
@@ -422,12 +547,73 @@ pub fn fetch_embedding(config: &EmbeddingConfig, input: &str) -> Result<Vec<f32>
 }
 
 fn fetch_embedding_blocking(config: &EmbeddingConfig, input: &str) -> Result<Vec<f32>> {
-    let url = format!("{}/embeddings", config.base_url.trim_end_matches('/'));
+    if config.max_input_tokens < 16 {
+        return Err(AppError::Validation(
+            "embedding max_input_tokens must be at least 16".to_string(),
+        ));
+    }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| AppError::Context(err.to_string()))?;
+    let pieces = split_input(input, config.max_input_tokens - TOKEN_OVERHEAD);
+    if pieces.len() == 1 {
+        return fetch_embedding_once(&client, config, pieces[0]);
+    }
+    let mut combined = vec![0.0f64; config.dimensions];
+    let mut weight_sum = 0usize;
+    for (index, piece) in pieces.iter().enumerate() {
+        let vector = fetch_embedding_once(&client, config, piece).map_err(|err| {
+            AppError::Context(format!(
+                "embedding part {}/{} failed: {err}",
+                index + 1,
+                pieces.len()
+            ))
+        })?;
+        if vector.len() != config.dimensions || vector.iter().any(|value| !value.is_finite()) {
+            return Err(AppError::Validation(format!(
+                "embedding part {}/{} returned an invalid vector (expected {} finite values)",
+                index + 1,
+                pieces.len(),
+                config.dimensions
+            )));
+        }
+        let weight = piece.len();
+        weight_sum += weight;
+        for (sum, value) in combined.iter_mut().zip(vector) {
+            *sum += f64::from(value) * weight as f64;
+        }
+    }
+    Ok(combined
+        .into_iter()
+        .map(|value| (value / weight_sum as f64) as f32)
+        .collect())
+}
+
+fn split_input(input: &str, max_bytes: usize) -> Vec<&str> {
+    if input.is_empty() {
+        return vec![input];
+    }
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while start < input.len() {
+        let mut end = start.saturating_add(max_bytes).min(input.len());
+        while !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        pieces.push(&input[start..end]);
+        start = end;
+    }
+    pieces
+}
+
+fn fetch_embedding_once(
+    client: &reqwest::blocking::Client,
+    config: &EmbeddingConfig,
+    input: &str,
+) -> Result<Vec<f32>> {
+    let url = format!("{}/embeddings", config.base_url.trim_end_matches('/'));
     let mut request = client.post(url).json(&serde_json::json!({
         "model": config.model,
         "input": input,
@@ -542,6 +728,64 @@ fn non_empty(value: Option<String>) -> Option<String> {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
+}
+
+fn configured_max_input_tokens(value: Option<String>) -> std::result::Result<usize, String> {
+    match value {
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 16)
+            .ok_or_else(|| {
+                "RUSTRANK_EMBEDDING_MAX_INPUT_TOKENS must be an integer of at least 16".to_string()
+            }),
+        None => Ok(DEFAULT_MAX_INPUT_TOKENS),
+    }
+}
+
+fn detect_max_input_tokens(base_url: &str, model: &str, api_key: Option<&str>) -> Option<usize> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    for path in ["model/info", "models"] {
+        let url = format!("{}/{path}", base_url.trim_end_matches('/'));
+        let mut request = client.get(url);
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = match request.send() {
+            Ok(response) if response.status().is_success() => response,
+            _ => continue,
+        };
+        let value: Value = match serde_json::from_reader(response.take(2 * 1024 * 1024)) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let detected = value
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|row| {
+                row.get("model_name").and_then(Value::as_str) == Some(model)
+                    || row.get("id").and_then(Value::as_str) == Some(model)
+            })
+            .filter_map(|row| {
+                row.get("model_info")
+                    .and_then(|info| info.get("max_input_tokens"))
+                    .or_else(|| row.get("max_input_tokens"))
+                    .and_then(Value::as_u64)
+                    .and_then(|limit| usize::try_from(limit).ok())
+                    .filter(|limit| *limit >= 16)
+            })
+            .min();
+        if detected.is_some() {
+            return detected;
+        }
+    }
+    None
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {

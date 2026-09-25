@@ -10,7 +10,7 @@ use crate::{
         Context, Definition, Import, Language, LocalModuleResolver, ModuleDef,
         all_supported_source_files, module_name_from_path, rel_string,
     },
-    embeddings::{self, EmbeddingOptions, EmbeddingSource},
+    embeddings::{self, EmbeddingCoverage, EmbeddingOptions, EmbeddingSource},
     error::{AppError, Result},
     process::{ProcessFlow, call_edges, derive_processes},
     project_config,
@@ -33,6 +33,7 @@ pub struct IndexProjectResponse {
     pub cache_misses: usize,
     pub stale_removed: usize,
     pub languages: Vec<LanguageIndexSummary>,
+    pub embedding_coverage: EmbeddingCoverage,
     pub warnings: Vec<String>,
 }
 
@@ -305,7 +306,17 @@ pub fn index_project_with_embeddings(
     let embedding_config = embeddings::config_for_repo(root, embedding_options)?;
     let embedding_stats =
         embeddings::index_embeddings(root, &embedding_config, &embedding_sources)?;
+    let embedding_coverage = embedding_stats.coverage(embedding_config.enabled);
     warnings.extend(embedding_stats.warnings);
+    if embedding_config.enabled {
+        eprintln!(
+            "RustRank: embedding cache coverage {}% ({}/{} current chunks, {} failed)",
+            embedding_coverage.percent,
+            embedding_coverage.cached_chunks + embedding_coverage.indexed_chunks,
+            embedding_coverage.total_chunks,
+            embedding_coverage.failed_chunks
+        );
+    }
 
     let source_modules = source_modules(root, &ctx, &indexed_files)?;
     let manifest = project_manifest(root, &summaries, &source_modules);
@@ -339,6 +350,7 @@ pub fn index_project_with_embeddings(
         cache_misses: total_misses,
         stale_removed,
         languages: summaries,
+        embedding_coverage,
         warnings,
     })
 }

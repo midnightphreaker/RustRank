@@ -34,7 +34,7 @@ const DEFAULT_HTTP_HOST: &str = "127.0.0.1";
 const DEFAULT_HTTP_PORT: &str = "63477";
 const DEFAULT_MCP_PATH: &str = "/mcp";
 const HEALTH_PATH: &str = "/healthz";
-const INDEX_PROJECT_USAGE: &str = "usage: rustrank index-project --repo-path <path> [--languages python,rust] [--force-rebuild] [--clean-stale] [--embeddings] [--embedding-base-url <url>] [--embedding-model <model>] [--embedding-dims <n>] [--embedding-api-key <key>]";
+const INDEX_PROJECT_USAGE: &str = "usage: rustrank index-project --repo-path <path> [--languages python,rust] [--force-rebuild] [--clean-stale] [--embeddings] [--embedding-base-url <url>] [--embedding-model <model>] [--embedding-dims <n>] [--embedding-max-input-tokens <n>] [--embedding-api-key <key>]";
 
 pub const ALL_TOOLS: &[&str] = &[
     "index_project",
@@ -67,15 +67,36 @@ pub struct RustRankRouter {
 impl RustRankRouter {
     pub fn new() -> Self {
         let embedding_config = crate::embeddings::validated_server_config().map_err(|problem| {
-            format!("Embeddings unavailable: {problem}. Configure RUSTRANK_EMBEDDING_BASE_URL, RUSTRANK_EMBEDDING_MODEL and RUSTRANK_EMBEDDING_DIMS (RUSTRANK_EMBEDDING_API_KEY is optional), then restart RustRank.")
+            format!("Embeddings unavailable: {problem}. Configure RUSTRANK_EMBEDDING_BASE_URL, RUSTRANK_EMBEDDING_MODEL and RUSTRANK_EMBEDDING_DIMS (RUSTRANK_EMBEDDING_API_KEY and RUSTRANK_EMBEDDING_MAX_INPUT_TOKENS are optional), then restart RustRank.")
         });
         if let Err(problem) = &embedding_config {
             eprintln!("RustRank DEBUG: {problem}");
+        } else if let Ok(config) = &embedding_config
+            && let Some(warning) = &config.metadata_warning
+        {
+            eprintln!("RustRank: {warning}");
         }
         Self {
             tool_router: Self::tool_router(),
             embedding_config,
         }
+    }
+
+    fn respond<T: serde::Serialize>(
+        &self,
+        result: crate::Result<T>,
+        repo_path: &str,
+    ) -> CallToolResult {
+        let mut response = json(result);
+        if let Some(warning) = coverage_warning(repo_path) {
+            response.content.push(Content::text(warning));
+        }
+        if let Ok(config) = &self.embedding_config
+            && let Some(warning) = &config.metadata_warning
+        {
+            response.content.push(Content::text(warning.clone()));
+        }
+        response
     }
 }
 
@@ -273,6 +294,10 @@ struct IndexProjectCli {
     #[arg(long, value_name = "N")]
     embedding_dims: Option<usize>,
 
+    /// Maximum endpoint input tokens; requests use a conservative UTF-8 byte bound.
+    #[arg(long, value_name = "N")]
+    embedding_max_input_tokens: Option<usize>,
+
     /// Embedding API key.
     #[arg(long, value_name = "KEY")]
     embedding_api_key: Option<String>,
@@ -303,16 +328,18 @@ struct QueryRequest {
 #[tool_router]
 impl RustRankRouter {
     #[tool(
-        description = "Build or refresh repository indexes and generated AGENTS.md guidance. Embeds bounded function/source chunks using the server’s RUSTRANK_EMBEDDING_* configuration. If embeddings are unavailable, still builds the structural index and returns a warning. embeddings defaults on; false skips vectors. Returns counts, cache statistics and warnings; clean_stale removes obsolete structural cache entries."
+        description = "Build or refresh repository indexes and generated AGENTS.md guidance. Embeds bounded function/source chunks using the server’s RUSTRANK_EMBEDDING_* configuration. embeddings defaults on; false skips vectors. Returns structural counts and embedding coverage; reports incomplete embedding work as an error with rerun guidance. Repeated calls retry missing chunks and rescan changed files; clean_stale removes obsolete structural cache entries."
     )]
     fn index_project(&self, Parameters(req): Parameters<IndexProjectRequest>) -> CallToolResult {
+        let embedding_requested = req.embeddings.unwrap_or(true);
         let options = match &self.embedding_config {
             Ok(config) => EmbeddingOptions {
-                enabled: Some(req.embeddings.unwrap_or(true)),
+                enabled: Some(embedding_requested),
                 base_url: Some(config.base_url.clone()),
                 model: Some(config.model.clone()),
                 dimensions: Some(config.dimensions),
                 api_key: config.api_key.clone(),
+                max_input_tokens: Some(config.max_input_tokens),
             },
             Err(_) => EmbeddingOptions {
                 enabled: Some(false),
@@ -334,12 +361,31 @@ impl RustRankRouter {
                 "Embeddings skipped; structural index built. {problem}"
             ));
         }
+        let incomplete = embedding_requested
+            && (self.embedding_config.is_err()
+                || result
+                    .as_ref()
+                    .is_ok_and(|response| response.embedding_coverage.failed_chunks > 0));
+        if let Ok(response) = &mut result
+            && response.embedding_coverage.failed_chunks > 0
+        {
+            response.warnings.push(format!(
+                "ERROR: {} embedding chunks failed; cache coverage is {}%. Correct the endpoint or token limit and run index_project again to fill the missing chunks.",
+                response.embedding_coverage.failed_chunks,
+                response.embedding_coverage.percent
+            ));
+        }
         if result.is_ok()
             && let Err(err) = agent::set_current_repo(repo_path)
         {
             return json::<()>(Err(err));
         }
-        json(result)
+        let output = self.respond(result, &req.repo_path);
+        if incomplete {
+            CallToolResult::error(output.content)
+        } else {
+            output
+        }
     }
 
     #[tool(
@@ -349,13 +395,16 @@ impl RustRankRouter {
         &self,
         Parameters(req): Parameters<ContextualSearchRequest>,
     ) -> CallToolResult {
-        json(search::contextual_search(
+        self.respond(
+            search::contextual_search(
+                &req.path,
+                &req.pattern,
+                req.file_type.as_deref(),
+                req.is_regex,
+                req.num_context_lines,
+            ),
             &req.path,
-            &req.pattern,
-            req.file_type.as_deref(),
-            req.is_regex,
-            req.num_context_lines,
-        ))
+        )
     }
 
     #[tool(
@@ -365,59 +414,70 @@ impl RustRankRouter {
         &self,
         Parameters(req): Parameters<SmartCodeSearchRequest>,
     ) -> CallToolResult {
-        json(search::smart_code_search(
+        self.respond(
+            search::smart_code_search(
+                &req.repo_path,
+                &req.pattern,
+                req.context_lines,
+                req.num_context_lines,
+            ),
             &req.repo_path,
-            &req.pattern,
-            req.context_lines,
-            req.num_context_lines,
-        ))
+        )
     }
 
     #[tool(
         description = "Find literal occurrences of an API name to learn local usage conventions. Returns up to max_examples file/line snippets, optionally labeled call, import, assignment or reference. Classification is text-based, not resolved API identity, so check matches before copying a pattern."
     )]
     fn api_usage(&self, Parameters(req): Parameters<ApiUsageRequest>) -> CallToolResult {
-        json(search::api_usage(
+        self.respond(
+            search::api_usage(
+                &req.repo_path,
+                &req.api_name,
+                req.max_examples,
+                req.group_by_pattern,
+            ),
             &req.repo_path,
-            &req.api_name,
-            req.max_examples,
-            req.group_by_pattern,
-        ))
+        )
     }
 
     #[tool(
         description = "Identify structurally important modules across supported languages using import-graph PageRank. Returns module names, scores, outgoing import counts and incoming importer counts (depth). Filter by module_prefix; enable external_modules to include unresolved imports. Scores measure graph importance, not code quality or runtime cost."
     )]
     fn coderank_analysis(&self, Parameters(req): Parameters<CodeRankRequest>) -> CallToolResult {
-        json(code_rank::coderank_analysis(
+        self.respond(
+            code_rank::coderank_analysis(
+                &req.repo_path,
+                req.top_n,
+                req.module_prefix.as_deref(),
+                req.external_modules,
+            ),
             &req.repo_path,
-            req.top_n,
-            req.module_prefix.as_deref(),
-            req.external_modules,
-        ))
+        )
     }
 
     #[tool(
         description = "Prioritize modules for review using import-graph importance weighted by a change-frequency estimate. Returns module scores, import counts and change_frequency; min_connections filters weakly connected modules. Frequency uses distinct Git blame commits where available, otherwise textual references, so it is a heuristic rather than a churn metric."
     )]
     fn code_hotspots(&self, Parameters(req): Parameters<HotspotRequest>) -> CallToolResult {
-        json(code_rank::code_hotspots(
+        self.respond(
+            code_rank::code_hotspots(&req.repo_path, req.top_n, req.min_connections),
             &req.repo_path,
-            req.top_n,
-            req.min_connections,
-        ))
+        )
     }
 
     #[tool(
         description = "Locate whole-word identifier occurrences across parsed source files. Returns file/line snippets labeled definition, usage, transformation or side_effect, plus inferred layers. The include flags enable extra classifications; they do not filter ordinary usages. This is textual tracing, not alias-aware data-flow or taint analysis."
     )]
     fn trace_data_flow(&self, Parameters(req): Parameters<DataFlowRequest>) -> CallToolResult {
-        json(trace::trace_data_flow(
+        self.respond(
+            trace::trace_data_flow(
+                &req.repo_path,
+                &req.identifier,
+                req.include_transformations,
+                req.include_side_effects,
+            ),
             &req.repo_path,
-            &req.identifier,
-            req.include_transformations,
-            req.include_side_effects,
-        ))
+        )
     }
 
     #[tool(
@@ -429,26 +489,35 @@ impl RustRankRouter {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        json(trace::trace_feature_impl(&req.repo_path, &keywords))
+        self.respond(
+            trace::trace_feature_impl(&req.repo_path, &keywords),
+            &req.repo_path,
+        )
     }
 
     #[tool(
         description = "Find modules that directly import target_module, using language-aware local import resolution. Returns import-site file/line snippets and target-to-dependent chains. Supply a module name from query or coderank_analysis. Use impact to explore callers beyond direct imports; this tool does not traverse transitive dependencies."
     )]
     fn trace_dep_impact(&self, Parameters(req): Parameters<DepImpactRequest>) -> CallToolResult {
-        json(trace::trace_dep_impact(&req.repo_path, &req.target_module))
+        self.respond(
+            trace::trace_dep_impact(&req.repo_path, &req.target_module),
+            &req.repo_path,
+        )
     }
 
     #[tool(
         description = "Scan source lines for try/except, raise and throw; optionally flag unwrap and panic patterns. Returns file/line snippets with pattern and heuristic severity. show_evolution adds Git blame commit counts within days_back when available, not historical error diffs. This is a pattern scan, not exhaustive error-handling analysis."
     )]
     fn error_patterns(&self, Parameters(req): Parameters<ErrorPatternsRequest>) -> CallToolResult {
-        json(analysis::error_patterns(
+        self.respond(
+            analysis::error_patterns(
+                &req.repo_path,
+                req.include_antipatterns,
+                req.show_evolution,
+                req.days_back,
+            ),
             &req.repo_path,
-            req.include_antipatterns,
-            req.show_evolution,
-            req.days_back,
-        ))
+        )
     }
 
     #[tool(
@@ -460,82 +529,99 @@ impl RustRankRouter {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        json(analysis::perf_bottleneck(
+        self.respond(
+            analysis::perf_bottleneck(&req.repo_path, &focus, req.include_utility),
             &req.repo_path,
-            &focus,
-            req.include_utility,
-        ))
+        )
     }
 
     #[tool(
         description = "Inspect a function by exact name for branch, loop, error-path and optional call-like source lines. Returns file/line snippets labeled by kind. max_depth limits reported findings per matching function, not call-stack depth. This is a static line scan, not executable path enumeration."
     )]
     fn exec_paths(&self, Parameters(req): Parameters<ExecPathsRequest>) -> CallToolResult {
-        json(analysis::exec_paths(
+        self.respond(
+            analysis::exec_paths(
+                &req.repo_path,
+                &req.function_name,
+                req.max_depth,
+                req.include_call_contexts,
+            ),
             &req.repo_path,
-            &req.function_name,
-            req.max_depth,
-            req.include_call_contexts,
-        ))
+        )
     }
 
     #[tool(
         description = "Compatibility alias for exec_paths with identical arguments and results. Prefer exec_paths for new calls. Scans exact-name function matches for branch, loop, error-path and optional call-like lines; max_depth caps findings per function, not call-stack depth."
     )]
     fn execute_paths(&self, Parameters(req): Parameters<ExecPathsRequest>) -> CallToolResult {
-        json(analysis::execute_paths(
+        self.respond(
+            analysis::execute_paths(
+                &req.repo_path,
+                &req.function_name,
+                req.max_depth,
+                req.include_call_contexts,
+            ),
             &req.repo_path,
-            &req.function_name,
-            req.max_depth,
-            req.include_call_contexts,
-        ))
+        )
     }
 
     #[tool(
         description = "Read the repository's .rustrank_config.json as a JSON object; returns an empty object when the file is absent. Use before changing language, exclusion or embedding settings. This returns stored configuration, not merged defaults or environment overrides, and does not modify files."
     )]
     fn get_config(&self, Parameters(req): Parameters<ConfigPathRequest>) -> CallToolResult {
-        json(config::get_config(&req.repo_path))
+        self.respond(config::get_config(&req.repo_path), &req.repo_path)
     }
 
     #[tool(
         description = "Persist a value in .rustrank_config.json and return the updated configuration. key is a dotted path such as languages.enabled; value accepts any JSON type. Creates the file if needed and replaces the selected value. Read get_config first to inspect existing settings; this does not rebuild indexes."
     )]
     fn set_config(&self, Parameters(req): Parameters<SetConfigRequest>) -> CallToolResult {
-        json(config::set_config(&req.repo_path, &req.key, req.value))
+        self.respond(
+            config::set_config(&req.repo_path, &req.key, req.value),
+            &req.repo_path,
+        )
     }
 
     #[tool(
         description = "Inspect a symbol before editing it. Returns its defining file and line span, module, kind, callers, callees, imports and related MCP resource URIs. Call relationships are static heuristics with confidence labels; verify them in source. Use query first if you do not know the symbol name."
     )]
     fn context(&self, Parameters(req): Parameters<ContextRequest>) -> CallToolResult {
-        json(agent::symbol_context(&req.repo_path, &req.symbol))
+        self.respond(
+            agent::symbol_context(&req.repo_path, &req.symbol),
+            &req.repo_path,
+        )
     }
 
     #[tool(
         description = "Estimate change impact for a symbol or module. Returns affected callers/importers as graph nodes and edges with distance and confidence, plus any stale-index warning. max_depth bounds caller traversal; import relationships are direct. Use before changing shared code; this is a static estimate, not proof of all dependencies."
     )]
     fn impact(&self, Parameters(req): Parameters<ImpactRequest>) -> CallToolResult {
-        json(agent::impact(&req.repo_path, &req.target, req.max_depth))
+        self.respond(
+            agent::impact(&req.repo_path, &req.target, req.max_depth),
+            &req.repo_path,
+        )
     }
 
     #[tool(
         description = "Review unstaged tracked-file changes against the Git index. Returns changed files, symbols overlapping added/modified lines, affected callers/importers and a heuristic risk level. Requires a Git working tree. Staged-only changes and untracked files are excluded; deletions may lack symbol mappings, so also review git diff."
     )]
     fn detect_changes(&self, Parameters(req): Parameters<ConfigPathRequest>) -> CallToolResult {
-        json(agent::detect_changes(&req.repo_path))
+        self.respond(agent::detect_changes(&req.repo_path), &req.repo_path)
     }
 
     #[tool(
         description = "Find relevant modules and symbols from whitespace-separated search terms. Ranks matches using names, paths, source text and importer counts, with chunk-level semantic matches using the server’s embedding configuration. Falls back to text and graph matching when embeddings are unavailable. Returns file/line locations, match reasons, scores, resource URIs and process hints. Start here for exploration; use contextual_search for exact or regex matches."
     )]
     fn query(&self, Parameters(req): Parameters<QueryRequest>) -> CallToolResult {
-        json(agent::query_with_embeddings(
+        self.respond(
+            agent::query_with_embeddings(
+                &req.repo_path,
+                &req.query,
+                req.limit,
+                self.embedding_config.as_ref().ok(),
+            ),
             &req.repo_path,
-            &req.query,
-            req.limit,
-            self.embedding_config.as_ref().ok(),
-        ))
+        )
     }
 }
 
@@ -601,7 +687,19 @@ impl ServerHandler for RustRankRouter {
         let uri = request.uri;
         std::future::ready(
             agent::read_current_resource(&uri)
-                .map(|text| {
+                .map(|mut text| {
+                    if let Ok(root) = agent::current_repo_root()
+                        && let Some(warning) = coverage_warning(&root.to_string_lossy())
+                    {
+                        text.push_str("\n\n");
+                        text.push_str(&warning);
+                    }
+                    if let Ok(config) = &self.embedding_config
+                        && let Some(warning) = &config.metadata_warning
+                    {
+                        text.push_str("\n\n");
+                        text.push_str(warning);
+                    }
                     ReadResourceResult::new(vec![
                         ResourceContents::text(text, uri).with_mime_type("text/markdown"),
                     ])
@@ -669,10 +767,18 @@ fn run_index_project_cli(req: IndexProjectCli) -> anyhow::Result<()> {
             model: req.embedding_model,
             dimensions: req.embedding_dims,
             api_key: req.embedding_api_key,
+            max_input_tokens: req.embedding_max_input_tokens,
         },
     )?;
     agent::set_current_repo(repo_path)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
+    if response.embedding_coverage.failed_chunks > 0 {
+        anyhow::bail!(
+            "{} embedding chunks failed; cache coverage is {}%. Correct the endpoint or token limit and run index-project again.",
+            response.embedding_coverage.failed_chunks,
+            response.embedding_coverage.percent
+        );
+    }
     Ok(())
 }
 
@@ -929,6 +1035,43 @@ fn json<T: serde::Serialize>(result: crate::Result<T>) -> CallToolResult {
             serde_json::json!({ "error": error }).to_string(),
         )]),
     }
+}
+
+fn coverage_warning(repo_path: &str) -> Option<String> {
+    let requested = std::path::Path::new(repo_path);
+    let root = requested
+        .ancestors()
+        .find(|ancestor| {
+            ancestor.join(".git").exists()
+                || ancestor
+                    .join(".rustrank/index/v1/embedding_coverage.json")
+                    .exists()
+        })
+        .or_else(|| requested.is_dir().then_some(requested))?;
+    let instruction = format!(
+        "Run index_project with repo_path={:?}, force_rebuild=false, clean_stale=true to retry missing embeddings and refresh added, changed or deleted files. Correct endpoint errors first; restart RustRank after changing its embedding environment.",
+        root.display().to_string()
+    );
+    let coverage_file = root.join(".rustrank/index/v1/embedding_coverage.json");
+    let coverage: crate::embeddings::EmbeddingCoverage = match std::fs::read(coverage_file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(coverage) => coverage,
+        None => {
+            return Some(format!(
+                "WARNING: RustRank embedding cache coverage is unknown. {instruction}"
+            ));
+        }
+    };
+    if coverage.percent == 100 {
+        return None;
+    }
+    let ready = coverage.cached_chunks + coverage.indexed_chunks;
+    Some(format!(
+        "WARNING: RustRank embedding cache coverage is {}% ({ready}/{} current chunks; {} failed). {instruction}",
+        coverage.percent, coverage.total_chunks, coverage.failed_chunks,
+    ))
 }
 
 #[cfg(test)]

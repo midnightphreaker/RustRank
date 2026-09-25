@@ -510,7 +510,7 @@ pub fn read_current_resource(uri: &str) -> Result<String> {
     }
 }
 
-fn current_repo_root() -> Result<PathBuf> {
+pub(crate) fn current_repo_root() -> Result<PathBuf> {
     if let Some(root) = CURRENT_REPO
         .get_or_init(|| Mutex::new(None))
         .lock()
