@@ -311,7 +311,11 @@ async fn unavailable_embeddings_keep_index_advertised_and_build_structural_index
     }
     for embeddings in [json!(false), json!(true), json!(null)] {
         let response = index_call(&mut client, json!({"repo_path":repo.path(),"force_rebuild":true,"clean_stale":false,"embeddings":embeddings})).await;
-        assert_ne!(response["result"]["isError"], true, "{response}");
+        assert_eq!(
+            response["result"]["isError"],
+            embeddings != json!(false),
+            "{response}"
+        );
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("RUSTRANK_EMBEDDING_BASE_URL"), "{text}");
     }
@@ -346,7 +350,7 @@ async fn fallback_index(client: &mut Client) -> Value {
         json!({"repo_path":repo.path(),"force_rebuild":false,"clean_stale":false}),
     )
     .await;
-    assert_ne!(result["result"]["isError"], true, "{result}");
+    assert_eq!(result["result"]["isError"], true, "{result}");
     assert!(
         repo.path()
             .join(".rustrank/index/v1/project_manifest.json")
