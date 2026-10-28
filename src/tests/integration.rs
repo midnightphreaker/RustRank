@@ -1,6 +1,10 @@
-use rustrank::context::{Context, DefKind, Language, supported_source_files};
+use rustrank::context::{
+    Context, DefKind, Definition, Language, LocalModuleResolver, ModuleDef,
+    supported_source_files,
+};
 use rustrank::embeddings::EmbeddingOptions;
 use rustrank::index::index_project_with_embeddings;
+use rustrank::process::call_edges;
 use rustrank::tools::ALL_TOOLS;
 use rustrank::tools::agent::{
     detect_changes, impact, query, read_current_resource, resource_templates, resources,
@@ -369,6 +373,35 @@ fn supported_source_files_honors_default_and_configured_excludes() {
     assert!(!paths.iter().any(|path| path.contains(".venv")));
     assert!(!paths.iter().any(|path| path.contains("generated")));
     assert!(paths.iter().any(|path| path == "pkg/core.py"));
+}
+
+#[test]
+fn supported_source_files_excludes_nested_dependency_directories() {
+    let fixture = fixture();
+    std::fs::create_dir_all(fixture.path().join("app/node_modules/pkg")).expect("nested deps");
+    std::fs::write(
+        fixture.path().join("app/node_modules/pkg/index.js"),
+        "export function vendored() {}",
+    )
+    .expect("vendored source");
+    std::fs::create_dir_all(fixture.path().join("app/src")).expect("app source dir");
+    std::fs::write(
+        fixture.path().join("app/src/app.js"),
+        "export function included() {}",
+    )
+    .expect("app source");
+
+    let files = supported_source_files(fixture.path()).expect("source files");
+    let paths = files
+        .iter()
+        .map(|(path, _)| path.strip_prefix(fixture.path()).unwrap().to_string_lossy())
+        .collect::<Vec<_>>();
+
+    assert!(
+        !paths.iter().any(|path| path.contains("node_modules")),
+        "nested node_modules must stay excluded: {paths:?}"
+    );
+    assert!(paths.iter().any(|path| path == "app/src/app.js"));
 }
 
 #[test]
@@ -2041,4 +2074,75 @@ fn semantic_chunks_on_one_long_line_do_not_multiply_the_match_score() {
         "duplicate source location inflated score: {rows:?}"
     );
     assert_eq!(rows[0].match_reasons, ["semantic"]);
+}
+
+fn test_module(path: &str, source: &str, defs: Vec<(&str, usize, usize)>) -> ModuleDef {
+    ModuleDef {
+        path: std::path::PathBuf::from(path),
+        language: Language::TypeScript,
+        imports: Vec::new(),
+        defs: defs
+            .into_iter()
+            .map(|(name, line, end_line)| Definition {
+                name: name.to_string(),
+                kind: DefKind::Func,
+                line,
+                end_line,
+                has_args: true,
+            })
+            .collect(),
+        source_lines: source.lines().map(str::to_string).collect(),
+        declared_namespaces: Vec::new(),
+    }
+}
+
+#[test]
+fn call_edges_resolves_a_unique_call_to_its_target() {
+    let modules = vec![
+        test_module(
+            "app/caller.ts",
+            "export function run() {\n  uniqueTarget();\n}",
+            vec![("run", 1, 3)],
+        ),
+        test_module(
+            "app/target.ts",
+            "export function uniqueTarget() {\n  return 1;\n}",
+            vec![("uniqueTarget", 1, 3)],
+        ),
+    ];
+    let resolver = LocalModuleResolver::new(&modules);
+
+    let edges = call_edges(&modules, &resolver);
+
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].source_symbol, "run");
+    assert_eq!(edges[0].target_symbol, "uniqueTarget");
+    assert_eq!(edges[0].call_line, 2);
+}
+
+#[test]
+fn call_edges_does_not_expand_ambiguous_symbol_names_quadratically() {
+    // Sixty files define `shared`, and the caller invokes it twenty-five times.
+    // Name-only matching expands every call site to every definition with that name.
+    let mut modules = vec![test_module(
+        "app/caller.ts",
+        &format!("export function run() {{\n{}}}", "  shared();\n".repeat(25)),
+        vec![("run", 1, 26)],
+    )];
+    for index in 0..60 {
+        modules.push(test_module(
+            &format!("lib/def{index}.ts"),
+            "export function shared() {\n  return 1;\n}",
+            vec![("shared", 1, 3)],
+        ));
+    }
+    let resolver = LocalModuleResolver::new(&modules);
+
+    let edges = call_edges(&modules, &resolver);
+
+    assert!(
+        edges.len() <= 25 * 8,
+        "ambiguous names must not expand to every definition, got {} edges",
+        edges.len()
+    );
 }

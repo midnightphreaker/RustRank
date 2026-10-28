@@ -670,6 +670,49 @@ fn template(uri: &str, name: &str, description: &str) -> ResourceTemplate {
 struct RepoGraph {
     modules: Vec<ModuleDef>,
     resolver: LocalModuleResolver,
+    importer_counts: HashMap<String, usize>,
+}
+
+/// Count importers for every module in one pass. Resolving imports per queried
+/// module turns a repository scan into quadratic work on large repositories.
+fn importer_counts(
+    modules: &[ModuleDef],
+    resolver: &LocalModuleResolver,
+) -> HashMap<String, usize> {
+    let known: HashSet<&str> = resolver
+        .module_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut counts = HashMap::new();
+    for module in modules {
+        for import in &module.imports {
+            let mut targets: HashSet<String> =
+                resolver.resolve_import_targets(module, import).into_iter().collect();
+            // Mirrors the textual fast path in `import_matches_target`.
+            let mut accept = |candidate: String| {
+                if known.contains(candidate.as_str()) {
+                    targets.insert(candidate);
+                }
+            };
+            let mut prefix = String::new();
+            for part in import.module.split('.') {
+                if !prefix.is_empty() {
+                    prefix.push('.');
+                }
+                prefix.push_str(part);
+                accept(prefix.clone());
+            }
+            if let Some(name) = &import.name {
+                accept(name.clone());
+                accept(format!("{}.{}", import.module, name));
+            }
+            for target in targets {
+                *counts.entry(target).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
 }
 
 impl RepoGraph {
@@ -679,7 +722,12 @@ impl RepoGraph {
         let ctx = Context::new(root.to_path_buf());
         let modules = ctx.parse_all()?;
         let resolver = LocalModuleResolver::new(&modules);
-        Ok(Self { modules, resolver })
+        let importer_counts = importer_counts(&modules, &resolver);
+        Ok(Self {
+            modules,
+            resolver,
+            importer_counts,
+        })
     }
 
     fn find_symbol(&self, symbol: &str) -> Option<(&ModuleDef, &Definition)> {
@@ -732,15 +780,7 @@ impl RepoGraph {
     }
 
     fn importer_count(&self, module_name: &str) -> usize {
-        self.modules
-            .iter()
-            .flat_map(|module| {
-                module.imports.iter().filter(|import| {
-                    self.resolver
-                        .import_matches_target(module, import, module_name)
-                })
-            })
-            .count()
+        self.importer_counts.get(module_name).copied().unwrap_or(0)
     }
 
     fn def_source(&self, module: &ModuleDef, def: &Definition) -> String {

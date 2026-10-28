@@ -172,10 +172,16 @@ pub fn resolve_language(root: &Path, path: &Path) -> Result<Option<Language>> {
 
 pub fn configured_excludes(repo_path: &Path) -> Result<ConfiguredExcludes> {
     let raw = get_raw_config(repo_path)?;
-    let mut path_patterns = default_excluded_paths()
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    let mut path_patterns = Vec::new();
+    for pattern in default_excluded_paths() {
+        // Defaults describe directories such as node_modules that may appear at
+        // any depth; keep the anchored form for a matching top-level directory
+        // and add an any-depth form for nested dependency trees.
+        path_patterns.push(pattern.to_string());
+        if !pattern.starts_with("**/") {
+            path_patterns.push(format!("**/{pattern}"));
+        }
+    }
     let mut extensions = default_excluded_extensions()
         .into_iter()
         .map(ToOwned::to_owned)

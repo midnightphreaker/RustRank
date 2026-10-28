@@ -1,11 +1,21 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::context::{Definition, LocalModuleResolver, ModuleDef};
 
 const MAX_PROCESS_DEPTH: usize = 6;
+/// A name defined more often than this is too ambiguous to resolve by name.
+/// Expanding every call site to every same-named definition grows quadratically.
+const MAX_TARGETS_PER_NAME: usize = 8;
+/// Hard ceiling so an unexpected shape can never exhaust the host's memory.
+const MAX_CALL_EDGES: usize = 200_000;
+
+static CALL_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("valid call pattern")
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessFlow {
@@ -95,7 +105,7 @@ pub fn call_edges(modules: &[ModuleDef], resolver: &LocalModuleResolver) -> Vec<
         );
 
     let mut edges = Vec::new();
-    for module in modules {
+    'modules: for module in modules {
         let source_module = resolver.module_name_for(module);
         let source_file = path_string(&module.path);
         for def in &module.defs {
@@ -103,9 +113,15 @@ pub fn call_edges(modules: &[ModuleDef], resolver: &LocalModuleResolver) -> Vec<
                 let Some(targets) = defs_by_name.get(&called) else {
                     continue;
                 };
+                if targets.len() > MAX_TARGETS_PER_NAME {
+                    continue;
+                }
                 for (target_module, target_def) in targets {
                     if std::ptr::eq(*target_module, module) && target_def.name == def.name {
                         continue;
+                    }
+                    if edges.len() >= MAX_CALL_EDGES {
+                        break 'modules;
                     }
                     edges.push(CallEdge {
                         source_module: source_module.clone(),
@@ -124,12 +140,11 @@ pub fn call_edges(modules: &[ModuleDef], resolver: &LocalModuleResolver) -> Vec<
     }
 
     edges.sort_by(|a, b| {
-        symbol_key(&a.source_module, &a.source_symbol)
-            .cmp(&symbol_key(&b.source_module, &b.source_symbol))
-            .then_with(|| {
-                symbol_key(&a.target_module, &a.target_symbol)
-                    .cmp(&symbol_key(&b.target_module, &b.target_symbol))
-            })
+        a.source_module
+            .cmp(&b.source_module)
+            .then_with(|| a.source_symbol.cmp(&b.source_symbol))
+            .then_with(|| a.target_module.cmp(&b.target_module))
+            .then_with(|| a.target_symbol.cmp(&b.target_symbol))
             .then_with(|| a.call_line.cmp(&b.call_line))
     });
     edges.dedup_by(|a, b| {
@@ -216,7 +231,7 @@ fn calls_in_definition(
     def: &Definition,
     known_symbols: &HashSet<String>,
 ) -> Vec<(String, usize)> {
-    let pattern = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("call regex");
+    let pattern = &*CALL_PATTERN;
     let start = def.line.saturating_sub(1);
     let end = def.end_line.max(def.line).min(module.source_lines.len());
     let mut calls = Vec::new();
